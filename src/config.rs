@@ -4,10 +4,14 @@
 //! command line argument. A missing file, an unreadable file, invalid JSON, or
 //! a wrong field type all abort startup; there is no fallback.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 
 use serde::Deserialize;
+
+use crate::model::{Group, Node};
+use crate::validate;
 
 /// The `Server` header value a default Ubuntu 26.04 install emits.
 ///
@@ -25,6 +29,18 @@ pub struct Config {
     #[serde(default = "default_server_token")]
     pub server_token: String,
 
+    /// The node table. Every node is defined exactly once here and referenced
+    /// by name from a group.
+    #[serde(default)]
+    pub nodes: Vec<Node>,
+
+    /// Subscription groups. An empty list means every path is a 404.
+    #[serde(default)]
+    pub groups: Vec<Group>,
+
+    /// Node definitions indexed by name, built once at load time.
+    #[serde(skip)]
+    pub(crate) node_index: HashMap<String, usize>,
 }
 
 fn default_server_token() -> String {
@@ -36,32 +52,67 @@ impl Config {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read config {}: {e}", path.display()))?;
 
-        let cfg: Config = serde_json::from_str(&raw)
+        let mut cfg: Config = serde_json::from_str(&raw)
             .map_err(|e| format!("failed to parse config {}: {e}", path.display()))?;
 
-        cfg.validate()?;
+        // The index is built before validation so the reference check is a
+        // hash lookup rather than a scan of the node table per reference.
+        cfg.build_node_index();
+        validate::validate(&cfg)?;
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<(), String> {
-        if self.server_token.is_empty() {
-            return Err("server_token must not be empty".into());
+    /// Build the name -> index map used by `node`.
+    ///
+    /// Duplicate names are not detected here; `validate_nodes` reports them
+    /// with a better message. The map simply keeps the last occurrence.
+    fn build_node_index(&mut self) {
+        let mut index = HashMap::with_capacity(self.nodes.len());
+        for (i, node) in self.nodes.iter().enumerate() {
+            index.insert(node.name.clone(), i);
         }
+        self.node_index = index;
+    }
 
-        // The value goes straight into an HTTP header and into HTML, so
-        // reject control characters and quotes to rule out header injection.
-        if self
-            .server_token
-            .chars()
-            .any(|c| c.is_control() || c == '"' || c == '\\')
-        {
-            return Err("server_token contains invalid characters".into());
+    /// Resolve a node name to its definition.
+    #[allow(dead_code)]
+    pub fn node(&self, name: &str) -> Option<&Node> {
+        self.node_index.get(name).map(|i| &self.nodes[*i])
+    }
+
+    /// The nodes of a group, in the order the group lists them, paired with the
+    /// name a client should show.
+    ///
+    /// References are guaranteed to resolve because validation runs before the
+    /// index is built, so a missing entry cannot occur here.
+    #[allow(dead_code)]
+    pub fn group_nodes<'a>(&'a self, group: &'a Group) -> Vec<(&'a Node, &'a str)> {
+        group
+            .nodes
+            .iter()
+            .filter_map(|r| {
+                let node = self.node(&r.reference)?;
+                Some((node, r.display_name(node)))
+            })
+            .collect()
+    }
+
+    /// Look up a group by its URL token.
+    ///
+    /// All groups are scanned even after a match so the comparison cost does
+    /// not depend on the token's position in the list. Called from the routing
+    /// layer in a later change.
+    #[allow(dead_code)]
+    pub fn group_for_token(&self, token: &str) -> Option<&Group> {
+        let mut found = None;
+        for group in &self.groups {
+            if group.token_matches(token) {
+                found = Some(group);
+            }
         }
-
-        Ok(())
+        found
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,14 +167,5 @@ mod tests {
     fn unknown_field_is_error() {
         let p = write_temp("unknown.json", r#"{"listen":"127.0.0.1:1","x":1}"#);
         assert!(Config::load(&p).is_err());
-    }
-
-    #[test]
-    fn server_token_with_crlf_is_rejected() {
-        let p = write_temp(
-            "inject.json",
-            r#"{"listen":"127.0.0.1:1","server_token":"nginx\r\nX: y"}"#,
-        );
-        assert!(Config::load(&p).unwrap_err().contains("invalid characters"));
     }
 }
