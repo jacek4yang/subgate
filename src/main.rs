@@ -112,8 +112,11 @@ async fn serve(mut stream: TcpStream, state: Arc<state::State>) -> std::io::Resu
         let req = match outcome {
             server::ReadOutcome::Request(r) => r,
             server::ReadOutcome::Closed => return Ok(()),
-            // Malformed request: nginx replies 400 and closes the connection.
-            server::ReadOutcome::BadRequest | server::ReadOutcome::TooLarge => {
+            // Malformed request, or a body shape we do not decode: reply 400
+            // and close, so the remainder cannot be read as a new request.
+            server::ReadOutcome::BadRequest
+            | server::ReadOutcome::TooLarge
+            | server::ReadOutcome::UnsupportedBody => {
                 let body = errors::page_400(&cfg.server_token);
                 let resp = routes::bad_request(&cfg, &body);
                 server::write_response(&mut stream, &resp.into_bytes(true)).await?;
