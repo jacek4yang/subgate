@@ -1,4 +1,34 @@
 {
   "listen": "127.0.0.1:8080",
-  "server_token": "nginx/1.28.3 (Ubuntu)"
+  "server_token": "nginx/1.28.3 (Ubuntu)",
+  "nodes": [
+    {
+      "name": "hk-1",
+      "address": "example.com",
+      "port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "public-key": "REPLACE_WITH_X25519_PUBLIC_KEY",
+      "short-id": "0123456789abcdef",
+      "server-name": "www.example.com"
+    }
+  ],
+  "groups": [
+    {
+      "token": "REPLACE_ME",
+      "name": "main",
+      "nodes": [
+        "hk-1"
+      ]
+    },
+    {
+      "token": "REPLACE_ME_TOO",
+      "name": "family",
+      "nodes": [
+        {
+          "ref": "hk-1",
+          "name": "Hong Kong 01"
+        }
+      ]
+    }
+  ]
 }

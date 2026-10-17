@@ -1,7 +1,9 @@
 mod assets;
 mod condition;
 mod config;
+mod validate;
 mod errors;
+mod model;
 mod range;
 mod routes;
 mod serialize;
