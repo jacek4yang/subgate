@@ -80,6 +80,23 @@ pub fn bad_request(cfg: &Config, body: &str) -> Response {
         .body(body.as_bytes().to_vec())
 }
 
+/// The 503 served while no valid config is loaded.
+///
+/// There is no live config to read `server_token` from, so the compiled-in
+/// default is used. That keeps the response shaped like the rest of the site
+/// instead of advertising a misconfiguration.
+pub fn service_unavailable() -> Response {
+    let body = errors::page_503(crate::config::DEFAULT_SERVER_TOKEN);
+    Response::new(503, "Service Temporarily Unavailable")
+        .header("Server", crate::config::DEFAULT_SERVER_TOKEN)
+        .header("Date", stealth::date_now())
+        .header("Content-Type", "text/html")
+        .header("Content-Length", body.len().to_string())
+        .header("Connection", "close")
+        .header("Retry-After", "5")
+        .body(body.into_bytes())
+}
+
 pub fn handle(cfg: &Config, req: &RequestView<'_>) -> Response {
     let head_only = req.method.eq_ignore_ascii_case("HEAD");
     let is_get = req.method.eq_ignore_ascii_case("GET");

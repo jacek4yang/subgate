@@ -187,6 +187,46 @@ Standard base64 of newline-separated `vless://` links. Every value is
 percent-encoded, so an `spider-x` of `/` or an ALPN list containing commas is
 safe. IPv6 addresses are bracketed.
 
+## Reloading
+
+Send `SIGHUP` to re-read the config:
+
+```bash
+systemctl reload subgate
+# or
+kill -HUP $(pidof subgate)
+```
+
+The file is read and fully validated before anything is swapped, so a failed
+reload never leaves a half-applied config. If validation fails:
+
+- the process keeps running;
+- the old config is **discarded**, so every request answers `503` with
+  `Retry-After: 5` rather than continuing to serve a config that no longer
+  matches the file;
+- once a reload succeeds, service resumes without a restart.
+
+There is no mtime polling: reload happens only on `SIGHUP`.
+
+The swap is a single `RwLock` write of an `Arc`, and each request takes one
+read lock, so reloading does not stall traffic.
+
+## Deployment
+
+`systemd/subgate.service` is a starting point:
+
+```ini
+ExecStart=/usr/local/bin/subgate /etc/subgate/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+```
+
+It runs as a `DynamicUser` with `ProtectSystem=strict` and
+`ReadOnlyPaths=/etc/subgate`, so the config cannot be modified by the service
+itself.
+
+Because `/etc/subgate` is read-only to the service, write the config as root and
+then reload.
+
 ## Source layout
 
 | File | Responsibility |
@@ -201,6 +241,7 @@ safe. IPv6 addresses are bracketed.
 | `config.rs` | Load, index, and query the config |
 | `validate.rs` | Every rule that decides what a config may contain |
 | `model.rs` | `Node`, `Group`, `NodeRef`, `Format` |
+| `state.rs` | Live config slot and SIGHUP reload semantics |
 | `render/clash.rs` | Clash YAML |
 | `render/v2ray.rs` | base64 `vless://` subscription |
 

@@ -42,6 +42,10 @@ pub fn page_416(token: &str) -> String {
     page("416 Requested Range Not Satisfiable", token)
 }
 
+pub fn page_503(token: &str) -> String {
+    page("503 Service Temporarily Unavailable", token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

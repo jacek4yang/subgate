@@ -1,0 +1,30 @@
+[Unit]
+Description=subgate subscription gateway
+Documentation=https://github.com/jacek4yang/subgate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/subgate /etc/subgate/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadOnlyPaths=/etc/subgate
+
+[Install]
+WantedBy=multi-user.target
