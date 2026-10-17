@@ -19,6 +19,7 @@ use crate::condition::{self, Precondition};
 use crate::config::Config;
 use crate::errors;
 use crate::range::{self, Outcome};
+use crate::render;
 use crate::serialize::Response;
 use crate::stealth;
 
@@ -83,6 +84,15 @@ pub fn handle(cfg: &Config, req: &RequestView<'_>) -> Response {
     let head_only = req.method.eq_ignore_ascii_case("HEAD");
     let is_get = req.method.eq_ignore_ascii_case("GET");
 
+    // Subscription paths are matched first. An unknown token returns `None`
+    // here and falls through to the same 404 as any other unknown path, so the
+    // two are indistinguishable.
+    if is_get || head_only {
+        if let Some(payload) = subscription(cfg, req.path) {
+            return subscription_response(cfg, req, payload, head_only);
+        }
+    }
+
     if req.path == "/" {
         if is_get || head_only {
             return home(cfg, req, head_only);
@@ -93,6 +103,48 @@ pub fn handle(cfg: &Config, req: &RequestView<'_>) -> Response {
     }
 
     error(cfg, req, (404, "Not Found"), errors::page_404(&cfg.server_token), head_only)
+}
+
+/// The rendered body of `/<token>/clash` or `/<token>/v2ray`.
+///
+/// `None` means the path is not a subscription: either the shape does not
+/// match or the token is unknown. Callers must treat that exactly like any
+/// other unknown path.
+fn subscription(cfg: &Config, path: &str) -> Option<(String, &'static str)> {
+    let rest = path.strip_prefix('/')?;
+    let (token, format) = rest.split_once('/')?;
+
+    if format.contains('/') {
+        return None;
+    }
+
+    let group = cfg.group_for_token(token)?;
+
+    match format {
+        "clash" => Some((render::clash::render(cfg, group), "text/yaml; charset=utf-8")),
+        "v2ray" => Some((render::v2ray::render(cfg, group), "text/plain; charset=utf-8")),
+        _ => None,
+    }
+}
+
+/// Wrap a rendered subscription in a response.
+///
+/// These responses are not part of the nginx disguise: they exist only on paths
+/// a client already has to know, and they carry `Cache-Control: no-store` so a
+/// rotated token takes effect immediately.
+fn subscription_response(
+    cfg: &Config,
+    req: &RequestView<'_>,
+    (body, content_type): (String, &'static str),
+    head_only: bool,
+) -> Response {
+    let len = body.len();
+    leading(cfg, Response::new(200, "OK"))
+        .header("Content-Type", content_type)
+        .header("Content-Length", len.to_string())
+        .header("Connection", req.connection_value())
+        .header("Cache-Control", "no-store")
+        .body(if head_only { Vec::new() } else { body.into_bytes() })
 }
 
 /// The first half of nginx's fixed headers: `Server` and `Date`.
@@ -394,6 +446,94 @@ mod tests {
         let out = text(handle(&cfg(), &req("GET", "/", &headers)), true);
         assert!(out.starts_with("HTTP/1.1 416 Requested Range Not Satisfiable\r\n"));
         assert!(out.contains("Content-Range: bytes */615\r\n"));
+    }
+
+    fn sub_cfg() -> Config {
+        let dir = std::env::temp_dir().join("subgate-route-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!("r{n}.json"));
+        std::fs::write(
+            &path,
+            r#"{
+                "listen": "127.0.0.1:1",
+                "nodes": [{
+                    "name": "hk-1", "address": "example.com", "port": 443,
+                    "uuid": "11111111-2222-3333-4444-555555555555",
+                    "public-key": "PUBKEY", "short-id": "ab",
+                    "server-name": "www.example.com"
+                }],
+                "groups": [{"token": "secret123", "name": "main", "nodes": ["hk-1"]}]
+            }"#,
+        )
+        .unwrap();
+        Config::load(&path).unwrap()
+    }
+
+    #[test]
+    fn clash_endpoint_serves_yaml() {
+        let out = text(handle(&sub_cfg(), &req("GET", "/secret123/clash", &[])), true);
+        assert!(out.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(out.contains("Content-Type: text/yaml; charset=utf-8\r\n"));
+        assert!(out.contains("Cache-Control: no-store\r\n"));
+        assert!(out.contains("type: vless"));
+        assert!(out.contains("name: hk-1"));
+    }
+
+    #[test]
+    fn v2ray_endpoint_serves_base64() {
+        let out = text(handle(&sub_cfg(), &req("GET", "/secret123/v2ray", &[])), true);
+        assert!(out.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(out.contains("Content-Type: text/plain; charset=utf-8\r\n"));
+        // The body is base64; decoding it must yield a vless link.
+        let body = out.split("\r\n\r\n").nth(1).unwrap();
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD.decode(body).unwrap();
+        assert!(String::from_utf8(decoded).unwrap().starts_with("vless://"));
+    }
+
+    #[test]
+    fn unknown_token_is_the_same_404_as_any_other_path() {
+        let cfg = sub_cfg();
+        let unknown = text(handle(&cfg, &req("GET", "/wrongtoken/clash", &[])), true);
+        let other = text(handle(&cfg, &req("GET", "/nope", &[])), true);
+
+        // Identical status, headers, and body: the two must not be tellable
+        // apart, or a token could be brute-forced by response shape.
+        let strip = |s: &str| -> String {
+            s.lines()
+                .map(|l| if l.starts_with("Date: ") { "Date: X" } else { l })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(strip(&unknown), strip(&other));
+        assert!(unknown.starts_with("HTTP/1.1 404 Not Found\r\n"));
+    }
+
+    #[test]
+    fn token_without_format_is_404() {
+        let out = text(handle(&sub_cfg(), &req("GET", "/secret123", &[])), true);
+        assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"));
+    }
+
+    #[test]
+    fn unknown_format_is_404() {
+        let out = text(handle(&sub_cfg(), &req("GET", "/secret123/singbox", &[])), true);
+        assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"));
+    }
+
+    #[test]
+    fn extra_path_segments_are_404() {
+        let out = text(handle(&sub_cfg(), &req("GET", "/secret123/clash/x", &[])), true);
+        assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"));
+    }
+
+    #[test]
+    fn head_subscription_has_no_body() {
+        let out = text(handle(&sub_cfg(), &req("HEAD", "/secret123/clash", &[])), true);
+        assert!(out.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(out.ends_with("\r\n\r\n"));
     }
 
     #[test]
