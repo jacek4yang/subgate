@@ -5,6 +5,7 @@ mod validate;
 mod errors;
 mod model;
 mod range;
+mod render;
 mod routes;
 mod serialize;
 mod server;

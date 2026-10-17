@@ -160,6 +160,33 @@ behaviour below was captured from a real nginx running in WSL and stored under
 |---|---|
 | Home page mtime | Derived from the asset at build time, so `Last-Modified` and `ETag` carry different values than the target machine's `index.nginx-debian.html` |
 
+## Subscription endpoints
+
+| Path | Output |
+|---|---|
+| `/<token>/clash` | mihomo / Clash Verge profile (`text/yaml`) |
+| `/<token>/v2ray` | v2rayN subscription, base64 of `vless://` links (`text/plain`) |
+
+Both send `Cache-Control: no-store`, so rotating a token takes effect at the
+next refresh.
+
+An unknown token, a token without a suffix, or any other suffix returns the
+same 404 as every other unknown path, byte for byte. A token cannot be
+discovered by comparing response shapes.
+
+### Clash
+
+A self-contained profile: `proxies`, a selector group named after the group, and
+`MATCH` into it. Scalars are quoted only when YAML requires it, so the document
+stays readable while names like `a: b`, `#hash`, or `true` still round-trip
+exactly.
+
+### v2ray
+
+Standard base64 of newline-separated `vless://` links. Every value is
+percent-encoded, so an `spider-x` of `/` or an ALPN list containing commas is
+safe. IPv6 addresses are bracketed.
+
 ## Source layout
 
 | File | Responsibility |
@@ -174,6 +201,8 @@ behaviour below was captured from a real nginx running in WSL and stored under
 | `config.rs` | Load, index, and query the config |
 | `validate.rs` | Every rule that decides what a config may contain |
 | `model.rs` | `Node`, `Group`, `NodeRef`, `Format` |
+| `render/clash.rs` | Clash YAML |
+| `render/v2ray.rs` | base64 `vless://` subscription |
 
 Loading builds the node index first, then validates. That order keeps the
 reference check a hash lookup instead of a scan of the node table for every
