@@ -5,10 +5,12 @@
 //! reorder or normalise headers and cannot do that.
 //!
 //! Only the subset a default nginx site actually exercises is implemented:
-//! - request line plus headers, with the request body ignored
+//! - request line plus headers; a request body is read and discarded so that it
+//!   cannot be mistaken for the next request on a persistent connection
 //! - persistent connections (HTTP/1.1 keeps alive by default, HTTP/1.0 needs
 //!   an explicit keep-alive)
-//! - no chunked request body support (this service never reads a body)
+//! - `Transfer-Encoding: chunked` request bodies are not decoded; such a
+//!   request is rejected rather than mis-parsed
 
 use std::io;
 
@@ -39,19 +41,36 @@ pub enum ReadOutcome {
     BadRequest,
     /// Headers exceeded the limit. nginx replies 400 in this case, so we do too.
     TooLarge,
+    /// A chunked body was sent. We do not decode it, so the connection must
+    /// close instead of treating the remainder as a new request.
+    UnsupportedBody,
 }
 
 pub async fn read_request(stream: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<ReadOutcome> {
     loop {
         if let Some(pos) = find_head_end(buf) {
             let head = buf[..pos].to_vec();
-            // Drop the consumed bytes. This service never reads a request body,
-            // so any `Content-Length` is ignored.
             buf.drain(..pos + 4);
 
             let text = String::from_utf8_lossy(&head);
-            let out = parse_head(&text);
-            return Ok(out);
+            let parsed = match parse_head(&text) {
+                ReadOutcome::Request(r) => r,
+                other => return Ok(other),
+            };
+
+            // This service never inspects a body, but it must still consume it.
+            // Leaving it in the buffer would make the next read parse the body
+            // as a request line.
+            if has_chunked_encoding(&parsed) {
+                return Ok(ReadOutcome::UnsupportedBody);
+            }
+
+            let body_len = content_length(&parsed);
+            if body_len > 0 {
+                discard_body(stream, buf, body_len).await?;
+            }
+
+            return Ok(ReadOutcome::Request(parsed));
         }
 
         if buf.len() > MAX_HEAD {
@@ -67,6 +86,56 @@ pub async fn read_request(stream: &mut TcpStream, buf: &mut Vec<u8>) -> io::Resu
             });
         }
     }
+}
+
+/// Drop `len` bytes of body, reading more from the socket if needed.
+async fn discard_body(stream: &mut TcpStream, buf: &mut Vec<u8>, len: usize) -> io::Result<()> {
+    // Bounded so a bogus `Content-Length` cannot pin a connection forever.
+    const MAX_DISCARD: usize = 64 * 1024 * 1024;
+    if len > MAX_DISCARD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request body too large",
+        ));
+    }
+
+    let from_buf = len.min(buf.len());
+    buf.drain(..from_buf);
+    let mut remaining = len - from_buf;
+
+    let mut scratch = [0u8; 8192];
+    while remaining > 0 {
+        let want = remaining.min(scratch.len());
+        let n = stream.read(&mut scratch[..want]).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed inside a request body",
+            ));
+        }
+        remaining -= n;
+    }
+
+    Ok(())
+}
+
+fn has_chunked_encoding(req: &ParsedRequest) -> bool {
+    req.headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
+    })
+}
+
+/// `Content-Length`, or 0 when absent or unparseable.
+///
+/// An unparseable value is treated as no body rather than an error: the
+/// request is still answered, and the connection closes afterwards if the
+/// framing was wrong.
+fn content_length(req: &ParsedRequest) -> usize {
+    req.headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 fn find_head_end(buf: &[u8]) -> Option<usize> {
@@ -145,6 +214,33 @@ mod tests {
             parse_head("GET / HTTP/1.1\r\nbad-header"),
             ReadOutcome::BadRequest
         ));
+    }
+
+    fn req_with(headers: &str) -> ParsedRequest {
+        match parse_head(&format!("POST / HTTP/1.1\r\n{headers}")) {
+            ReadOutcome::Request(r) => r,
+            _ => panic!("expected a parsed request"),
+        }
+    }
+
+    #[test]
+    fn content_length_is_read() {
+        assert_eq!(content_length(&req_with("Content-Length: 42\r\n")), 42);
+        assert_eq!(content_length(&req_with("content-length:7\r\n")), 7);
+        assert_eq!(content_length(&req_with("")), 0);
+        // A value that does not parse is treated as no body.
+        assert_eq!(content_length(&req_with("Content-Length: abc\r\n")), 0);
+    }
+
+    #[test]
+    fn chunked_body_is_detected() {
+        assert!(has_chunked_encoding(&req_with(
+            "Transfer-Encoding: chunked\r\n"
+        )));
+        assert!(has_chunked_encoding(&req_with(
+            "transfer-encoding: Chunked\r\n"
+        )));
+        assert!(!has_chunked_encoding(&req_with("Content-Length: 3\r\n")));
     }
 
     #[test]
