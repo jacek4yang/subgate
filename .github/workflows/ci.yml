@@ -12,6 +12,13 @@ jobs:
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo test --locked --all-targets
       - run: cargo build --release --locked
+      - name: Run integration shell tests (nginx privacy, upgrade/rollback, soak)
+        run: |
+          sudo apt-get update && sudo apt-get install -y nginx curl openssl
+          chmod +x scripts/*.sh tests/*.sh
+          ./tests/nginx_privacy_test.sh
+          ./tests/upgrade_rollback_test.sh
+          ./tests/soak_test.sh --duration 5 --concurrency 6
   audit:
     runs-on: ubuntu-latest
     steps:

@@ -1,6 +1,7 @@
 mod assets;
 mod condition;
 mod config;
+mod control;
 mod errors;
 mod limits;
 mod model;
@@ -32,30 +33,89 @@ async fn main() {
         )
         .init();
 
-    // `--check <config.json>` validates a config file and exits, for
-    // `ExecReload=` pre-validation and CI. No config file is bound.
-    if std::env::args().nth(1).as_deref() == Some("--check") {
-        let Some(path) = std::env::args().nth(2) else {
-            eprintln!("usage: subgate [--check] <config.json>");
-            std::process::exit(2);
-        };
-        match config::Config::load(std::path::Path::new(&path)) {
-            Ok(_) => {
-                println!("config ok");
-                std::process::exit(0);
+    let arg1 = std::env::args().nth(1);
+    let path: PathBuf = match arg1.as_deref() {
+        Some("--check") => {
+            let Some(p) = std::env::args().nth(2) else {
+                eprintln!("usage: subgate [--check|--reload|--status] <config.json>");
+                std::process::exit(2);
+            };
+            let cfg_path = std::path::Path::new(&p);
+            let _cfg = match config::Config::load(cfg_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("config error: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            #[cfg(unix)]
+            {
+                let sock_path = control::control_socket_path();
+                if sock_path.exists() {
+                    if let Ok(status) = control::send_command(&sock_path, "STATUS").await {
+                        for part in status.split_whitespace() {
+                            if let Some(listen_str) = part.strip_prefix("listen=") {
+                                if listen_str != _cfg.listen.to_string() {
+                                    eprintln!(
+                                        "config warning: listen address changed from {listen_str} to {}; runtime reload will reject this and require a restart",
+                                        _cfg.listen
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!("config error: {e}");
+
+            println!("config ok");
+            std::process::exit(0);
+        }
+        Some("--reload") => {
+            #[cfg(unix)]
+            {
+                let sock_path = control::control_socket_path();
+                match control::send_command(&sock_path, "RELOAD").await {
+                    Ok(msg) => {
+                        println!("config reloaded ({msg})");
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("reload failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                eprintln!("error: control socket reload is only supported on Unix systems");
                 std::process::exit(1);
             }
         }
-    }
-
-    // The config file is mandatory; its path is the only command line argument.
-    let path: PathBuf = match std::env::args().nth(1) {
-        Some(p) => PathBuf::from(p),
-        None => {
-            eprintln!("usage: subgate [--check] <config.json>");
+        Some("--status") => {
+            #[cfg(unix)]
+            {
+                let sock_path = control::control_socket_path();
+                match control::send_command(&sock_path, "STATUS").await {
+                    Ok(msg) => {
+                        println!("{msg}");
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("status query failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                eprintln!("error: control socket is only supported on Unix systems");
+                std::process::exit(1);
+            }
+        }
+        Some(p) if !p.starts_with('-') => PathBuf::from(p),
+        _ => {
+            eprintln!("usage: subgate [--check|--reload|--status] <config.json>");
             std::process::exit(2);
         }
     };
@@ -82,6 +142,16 @@ async fn main() {
     };
 
     tracing::info!("listening on {}", listener.local_addr().unwrap_or(addr));
+
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+    #[cfg(unix)]
+    {
+        let sock_path = control::control_socket_path();
+        let state_ctrl = Arc::clone(&state);
+        tokio::spawn(async move {
+            control::run_control_listener(state_ctrl, sock_path, _shutdown_rx).await;
+        });
+    }
 
     // Signal streams are registered once, before the loop: a registration
     // created per iteration could drop a signal arriving between iterations.
@@ -126,7 +196,7 @@ async fn main() {
                 // A config file is a few kilobytes, so the read is bounded and
                 // this never meaningfully stalls accept().
                 match state.reload() {
-                    Ok(()) => tracing::info!("config reloaded"),
+                    Ok(gen) => tracing::info!("config reloaded (generation {gen})"),
                     Err(e) => tracing::error!("reload failed, keeping last known good config: {e}"),
                 }
                 // Re-arm for the next SIGHUP.
@@ -134,6 +204,7 @@ async fn main() {
             }
             _ = &mut shutdown => {
                 tracing::info!("shutting down");
+                let _ = shutdown_tx.send(true);
                 break;
             }
         }
@@ -171,19 +242,14 @@ async fn serve(mut stream: TcpStream, state: Arc<state::State>) -> std::io::Resu
         };
 
         // An empty buffer means this is a fresh keep-alive wait: apply the
-        // idle timeout. Once bytes are buffered (a partial head or a body
-        // being received), the header timeout applies. On elapse the
-        // connection closes silently, nginx-like.
+        // idle timeout. Once bytes are buffered (a partial head), the header
+        // timeout applies. On elapse the connection closes silently, nginx-like.
         let timeout = if buf.is_empty() { lim.idle } else { lim.header };
-        let outcome = match tokio::time::timeout(
-            timeout,
-            server::read_request(&mut stream, &mut buf),
-        )
-        .await
-        {
-            Ok(v) => v?,
-            Err(_) => return Ok(()),
-        };
+        let outcome =
+            match tokio::time::timeout(timeout, server::read_head(&mut stream, &mut buf)).await {
+                Ok(v) => v?,
+                Err(_) => return Ok(()),
+            };
 
         let req = match outcome {
             server::ReadOutcome::Request(r) => r,
@@ -206,6 +272,21 @@ async fn serve(mut stream: TcpStream, state: Arc<state::State>) -> std::io::Resu
                 return Ok(());
             }
         };
+
+        // If a request declared a body, consume it bounded by `lim.body`.
+        if let Some(err_outcome) = server::consume_body(&mut stream, &mut buf, &req).await? {
+            let (status, body) = match err_outcome {
+                server::ReadOutcome::BodyTooLarge => (413, errors::page_413(&cfg.server_token)),
+                _ => (400, errors::page_400(&cfg.server_token)),
+            };
+            let resp = if status == 413 {
+                routes::too_large_body(&cfg, &body)
+            } else {
+                routes::bad_request(&cfg, &body)
+            };
+            server::write_response(&mut stream, &resp.into_bytes(true)).await?;
+            return Ok(());
+        }
 
         let headers_lower: Vec<(String, String)> = req
             .headers

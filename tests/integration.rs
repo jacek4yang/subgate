@@ -640,3 +640,37 @@ fn test_header_timeout_enforcement() {
         "stalled client should be disconnected on header timeout"
     );
 }
+
+#[test]
+fn test_limits_zero_env_fallback() {
+    // Zero values must not brick the server: they fall back to safe defaults
+    let server = TestServer::spawn_with_env(&[
+        ("SUBGATE_MAX_CONNS", "0"),
+        ("SUBGATE_KEEPALIVE_REQUESTS", "0"),
+        ("SUBGATE_TIMEOUT_MS", "0"),
+    ]);
+    let mut conn = server.connect();
+    let (head, body) =
+        send_and_read_response(&mut conn, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "got: {head}");
+    assert!(String::from_utf8_lossy(&body).contains("Welcome to nginx!"));
+}
+
+#[test]
+fn test_cli_extended_flags() {
+    let bin = env!("CARGO_BIN_EXE_subgate");
+
+    // --status without running instance should report error
+    let output = std::process::Command::new(bin)
+        .arg("--status")
+        .output()
+        .expect("run subgate --status");
+    assert!(!output.status.success());
+
+    // --reload without running instance should report error
+    let output = std::process::Command::new(bin)
+        .arg("--reload")
+        .output()
+        .expect("run subgate --reload");
+    assert!(!output.status.success());
+}
