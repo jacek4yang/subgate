@@ -1,195 +1,124 @@
 # subgate
 
-Single-binary subscription gateway for VLESS+Reality. Serves mihomo / v2rayN
-subscriptions, and everything else looks like a default nginx install.
+Production-ready single-binary subscription gateway for VLESS+Reality. Serves Mihomo (Clash) and v2rayN subscriptions while impersonating a default Ubuntu nginx 1.28.3 install for all other requests.
 
-## Status
+## Overview
 
-- PR #1: nginx-compatible static front.
-- PR #2: decoupled node table, group references, per-group display names,
-  and strict config validation (no routes yet).
+- **Subscription endpoints**: Generates Mihomo / Clash Verge YAML profiles and v2rayN `vless://` base64 subscriptions.
+- **Group isolation & display names**: Shared top-level node definitions with per-group display name overrides and token isolation.
+- **Stealth front**: Byte-for-byte alignment with standard Ubuntu nginx static responses, status pages (404, 405, 412, 413, 416), header casing/ordering, ETag, and Range handling.
+- **Hardened HTTP/1.1 framing**: Strict RFC 9112 origin-form target verification, single `Host` header enforcement, rejection of request smuggling vectors (Transfer-Encoding, duplicate Content-Length, obsolete line folding).
+- **Resource bounds**: Concurrency semaphores (`max_conns`), request head and body limits, timeouts for idle/header/body/write phases, and Range amplification bounds.
+- **Safe configuration lifecycle**: Atomic runtime swaps, failure tolerance retaining the last-known-good configuration, and CLI validation (`--check`).
+- **Production deployment**: Hardened systemd unit with `DynamicUser=yes`, least-privilege permissions, and an nginx reverse proxy configuration.
 
-## Run
+## CLI Usage
 
 ```bash
-cargo build --release
-./target/release/subgate config.json
+# Validate configuration without starting network listener (exit 0 on success, 1 on error):
+subgate --check /etc/subgate/config.json
+
+# Run gateway in production:
+subgate /etc/subgate/config.json
 ```
 
-The config file is mandatory. A missing file, invalid JSON, or an unknown field
-aborts startup with exit code 1.
+## Security Model
+
+### Token Security Policy
+
+- **Token entropy**: Tokens act as the authorization secret protecting your node table. Production tokens must be generated using a cryptographically secure random generator with at least 128 bits of entropy.
+  ```bash
+  # Generate 192 bits of base64url entropy (24 bytes, 32 characters):
+  openssl rand -base64 24 | tr '+/' '-_' | tr -d '='
+  ```
+- **Token validation**: Tokens must contain only ASCII alphanumeric characters, `-`, and `_`, with a length between 16 and 128 characters.
+- **Constant-time comparison**: Token matching evaluates every character and iterates over all configured groups without early exits, preventing timing attacks.
+- **Disproportionate computation guard**: Requests with token segments outside 16..=128 characters or containing invalid characters are rejected immediately in O(1) without group scanning.
+- **Secret non-disclosure**: Tokens and secret keys are never emitted in application logs, error messages, or response headers. Error logs identify groups exclusively by `group.name`.
+- **Cache control**: Subscription responses always emit `Cache-Control: no-store` to prevent intermediary or browser caching of subscription credentials.
+- **Response shape invariance**: Unknown tokens, missing formats, unsupported methods, or non-existent paths return identical nginx 404 responses. Probing cannot disclose token existence.
+
+## Configuration Format
 
 ```json
 {
   "listen": "127.0.0.1:8080",
-  "server_token": "nginx/1.28.3 (Ubuntu)"
-}
-```
-
-- `listen` is required.
-- `server_token` defaults to `nginx/1.28.3 (Ubuntu)`, the value a stock Ubuntu
-  26.04 install emits. It drives both the `Server` header and the
-  `<hr><center>...</center>` line of the error pages, so they can never drift
-  apart — the same invariant real nginx maintains through `server_tokens`.
-- `nodes` and `groups` default to empty lists, which leaves every path a 404.
-
-## Nodes and groups
-
-Nodes are defined once in a top-level `nodes` table and referenced by name from
-any number of groups. Editing a node updates every subscription that publishes
-it, and nothing is duplicated.
-
-```json
-{
+  "server_token": "nginx/1.28.3 (Ubuntu)",
   "nodes": [
     {
       "name": "hk-1",
       "address": "example.com",
       "port": 443,
       "uuid": "00000000-0000-0000-0000-000000000000",
-      "public-key": "REPLACE_WITH_X25519_PUBLIC_KEY",
+      "public-key": "bK4PTQX5dwqSdVBzADrqhPtALBwj9b0uYjYR29lS4xE",
       "short-id": "0123456789abcdef",
-      "server-name": "www.example.com"
+      "server-name": "www.example.com",
+      "flow": "xtls-rprx-vision",
+      "fingerprint": "chrome",
+      "alpn": ["h2", "http/1.1"],
+      "spider-x": "/"
     }
   ],
   "groups": [
-    { "token": "abc123", "name": "main",   "nodes": ["hk-1"] },
-    { "token": "def456", "name": "family", "nodes": [{ "ref": "hk-1", "name": "Hong Kong 01" }] }
+    {
+      "token": "kQ7vT2xLm9pZr4sW8yB3nE6hJ5cD1fG0",
+      "name": "main",
+      "nodes": ["hk-1"]
+    },
+    {
+      "token": "uX2wN8pQ4tK7vB1mZ5cR9dF3hJ6sL0aE",
+      "name": "family",
+      "nodes": [
+        {
+          "ref": "hk-1",
+          "name": "Hong Kong Fast"
+        }
+      ]
+    }
   ]
 }
 ```
 
-`group.nodes` holds **references**, and their order is the order clients
-receive. A reference is either a bare node name or an object:
+### Semantic Validation Rules
 
-```json
-{ "ref": "hk-1", "name": "Hong Kong 01" }
-```
+Validation occurs at startup and upon reload:
+- **`listen`**: Valid IPv4 or IPv6 socket address (e.g. `127.0.0.1:8080`). Cannot be changed across SIGHUP reloads without restart.
+- **`uuid`**: Standard 8-4-4-4-12 hex UUID format.
+- **`public-key`**: Base64 or base64url string decoding to exactly 32 bytes (X25519 public key).
+- **`short-id`**: Even-length hexadecimal string up to 16 characters (or empty string if server performs no short-id matching).
+- **`address`**: Valid hostname, IPv4, or bracketed IPv6 address without whitespace, `/`, `@`, `?`, or `#`.
+- **`port`**: 1–65535 (port 0 rejected).
+- **`server-name`**: Valid Reality SNI hostname without whitespace, `/`, or `:`.
+- **`group.name`**: Non-empty, without control characters, commas, or YAML syntax characters that could corrupt Mihomo `MATCH,<group.name>` rules.
+- **Display name uniqueness**: Every effective node display name within a single group must be unique.
+- **Node references**: References in groups must resolve to valid node definitions. No node may be referenced twice within the same group.
 
-`ref` names a node in the top-level table. The optional `name` overrides the
-label shown in the client, so the same node can be called something different
-in each subscription that publishes it. Without an override the node's own
-`name` is used.
+## Resource Limits & DoS Controls
 
-A node may appear in several groups, but not twice within one group — even
-under two different display names, since it is still the same node. An
-unreferenced node is allowed, so nodes can be staged before assignment.
+All network resource bounds are centralized in `src/limits.rs` and can be adjusted via environment variables:
 
-### Node fields
+| Resource | Default | Environment Override | Behavior on Limit |
+|---|---|---|---|
+| Concurrent connections | 512 | `SUBGATE_MAX_CONNS` | Excess accepted TCP streams dropped immediately |
+| Keepalive requests | 1000 | `SUBGATE_KEEPALIVE_REQUESTS` | Final request emits `Connection: close` and shuts down socket |
+| Phase timeouts | 60–65s | `SUBGATE_TIMEOUT_MS` | Idle (65s), Header (60s), Body (60s), Write (60s); closes connection on elapse |
+| Max request head size | 16 KiB | Hard limit | 400 Bad Request & Connection close |
+| Max request headers | 100 | Hard limit | 400 Bad Request & Connection close |
+| Max request body size | 8 MiB | Hard limit | 413 Request Entity Too Large & Connection close |
+| Max multipart ranges | 100 | Hard limit | Capped; requests exceeding 100 ranges fall back to 200 OK full body |
 
-Every field below must appear in the config. A missing or misspelled key is a
-startup error, not a silent default:
+## Subscription Endpoints
 
-| Field | Rule |
-|---|---|
-| `name` | non-empty |
-| `address` | non-empty |
-| `port` | 1–65535 |
-| `uuid` | non-empty |
-| `public-key` | non-empty |
-| `short-id` | **must be present**; an empty string is valid |
-| `server-name` | **must be present and non-empty** |
+| Path | Format | Content-Type | Description |
+|---|---|---|---|
+| `/<token>/clash` | Mihomo / Clash Verge | `text/yaml; charset=utf-8` | Standalone profile with `proxies`, select group, and `MATCH` rule |
+| `/<token>/v2ray` | v2rayN / v2rayNG | `text/plain; charset=utf-8` | Standard base64-encoded `vless://` share links |
 
-`short-id` may be empty because a Reality server that performs no shortId
-matching accepts any client. `server-name` is the SNI the handshake
-impersonates; an empty value produces a node that renders without error and
-then fails to connect, so it is rejected outright.
+Subscription responses carry `Cache-Control: no-store` and `Connection: keep-alive` (or `close`).
 
-Optional, with the defaults a Reality client expects:
+## Configuration Reload Lifecycle
 
-| Field | Default |
-|---|---|
-| `flow` | `xtls-rprx-vision` |
-| `fingerprint` | `chrome` |
-| `alpn` | `["h2", "http/1.1"]` |
-| `spider-x` | `""` |
-
-`flow` may be set to an empty string to omit flow control entirely.
-
-Validation happens at load time. These are all fatal:
-
-- an empty or non-ASCII-alphanumeric token (it becomes a URL path segment)
-- duplicate tokens, group names, or node names
-- a group referencing a node that does not exist, or an empty reference
-- a group listing the same node twice, with or without a display-name override
-- an empty or whitespace-only group name or display-name override
-- an empty node name, address, uuid, or public-key
-- a port of 0
-- a control character in any group name, display name, or node field. These
-  values are written verbatim into YAML and subscription links, so a newline
-  would corrupt the output
-- an empty ALPN entry, or one containing a comma, which would silently split
-  into two entries when the list is joined
-- any unknown field, at every level
-
-Optional node fields (`flow`, `fingerprint`, `short-id`, `server-name`,
-`spider-x`) may be left blank — that is how a client is told to omit them — but
-they are still subject to the control-character rule.
-
-Token comparison is constant-time, and every group is scanned even after a
-match, so lookup cost does not depend on a token's position.
-
-## Stealth model
-
-The impersonation target is a default Ubuntu nginx 1.28.3 install. Every
-behaviour below was captured from a real nginx running in WSL and stored under
-`tests/golden/`; the test suite asserts on those bytes.
-
-### Aligned
-
-| Item | Behaviour |
-|---|---|
-| Home page body | Ubuntu's `index.nginx-debian.html`, 615 bytes, byte-identical |
-| Header order | `Server → Date → Content-Type → Content-Length → Last-Modified → Connection → ETag → Accept-Ranges → Content-Range` |
-| Header casing | Exactly as nginx writes it, including `ETag` (not `Etag`) |
-| `Last-Modified` / `ETag` | Derived from the asset's size and mtime, same rule as `ngx_http_set_etag()` |
-| 404 / 405 / 416 | nginx built-in pages with the `<hr><center>` tail; no `ETag`, `Last-Modified` or `Accept-Ranges` |
-| 304 | Keeps `ETag` and `Last-Modified`, sends **no** `Content-Type`, `Content-Length` or `Accept-Ranges` |
-| `If-Modified-Since` | Exact semantics: 304 only when the timestamp is **equal** |
-| `If-None-Match` | Supports `W/` weak comparison, comma lists, and `*` |
-| `If-Match` / `If-Unmodified-Since` | 412 when unsatisfied |
-| `Range` | Single range 206, suffix `-N`, open-ended `start-`, clamping, 416 on invalid |
-| Multi-range | `multipart/byteranges` with nginx's 20-digit zero-padded process-wide boundary counter |
-| `If-Range` | Strong ETag match, or exact date match |
-| `Connection` | HTTP/1.0 defaults to `close` unless `keep-alive` is requested; HTTP/1.1 defaults to `keep-alive` |
-| `Keep-Alive` header | **Not sent** — Ubuntu's default config leaves the second `keepalive_timeout` argument unset |
-
-### Known differences
-
-| Item | Reason |
-|---|---|
-| Home page mtime | Derived from the asset at build time, so `Last-Modified` and `ETag` carry different values than the target machine's `index.nginx-debian.html` |
-
-## Subscription endpoints
-
-| Path | Output |
-|---|---|
-| `/<token>/clash` | mihomo / Clash Verge profile (`text/yaml`) |
-| `/<token>/v2ray` | v2rayN subscription, base64 of `vless://` links (`text/plain`) |
-
-Both send `Cache-Control: no-store`, so rotating a token takes effect at the
-next refresh.
-
-An unknown token, a token without a suffix, or any other suffix returns the
-same 404 as every other unknown path, byte for byte. A token cannot be
-discovered by comparing response shapes.
-
-### Clash
-
-A self-contained profile: `proxies`, a selector group named after the group, and
-`MATCH` into it. Scalars are quoted only when YAML requires it, so the document
-stays readable while names like `a: b`, `#hash`, or `true` still round-trip
-exactly.
-
-### v2ray
-
-Standard base64 of newline-separated `vless://` links. Every value is
-percent-encoded, so an `spider-x` of `/` or an ALPN list containing commas is
-safe. IPv6 addresses are bracketed.
-
-## Reloading
-
-Send `SIGHUP` to re-read the config:
+To reload configuration without dropping active connections:
 
 ```bash
 systemctl reload subgate
@@ -197,68 +126,82 @@ systemctl reload subgate
 kill -HUP $(pidof subgate)
 ```
 
-The file is read and fully validated before anything is swapped, so a failed
-reload never leaves a half-applied config. If validation fails:
+1. **Pre-flight verification**: When invoked via systemd, `subgate --check` validates the configuration before sending `SIGHUP`. If invalid, `systemctl reload` returns failure immediately.
+2. **Atomic swap**: The file is read (up to 1 MiB) and fully validated. A successful parse atomically replaces the running `Arc<Config>`. In-flight requests continue using their existing snapshot.
+3. **Failure resilience**: If a reload fails (syntax error, file read failure, or semantic validation failure), subgate logs the failure and **retains the last-known-good configuration**, keeping service available.
+4. **Listen address lock**: Sockets are bound at process boot. Changing `listen` requires restarting the process.
 
-- the process keeps running;
-- the old config is **discarded**, so every request answers `503` with
-  `Retry-After: 5` rather than continuing to serve a config that no longer
-  matches the file;
-- once a reload succeeds, service resumes without a restart.
+## Production Deployment
 
-There is no mtime polling: reload happens only on `SIGHUP`.
+### 1. File Permissions & DynamicUser
 
-The swap is a single `RwLock` write of an `Arc`, and each request takes one
-read lock, so reloading does not stall traffic.
+`systemd/subgate.service` uses `DynamicUser=yes` with strict sandbox isolation. Configuration files should be owned by root and readable by the `subgate` group:
 
-## Deployment
+```bash
+# Create subgate system group if not present
+groupadd -r subgate
 
-`systemd/subgate.service` is a starting point:
-
-```ini
-ExecStart=/usr/local/bin/subgate /etc/subgate/config.json
-ExecReload=/bin/kill -HUP $MAINPID
+# Secure directory and configuration file
+mkdir -p /etc/subgate
+chown -R root:subgate /etc/subgate
+chmod 0750 /etc/subgate
+chmod 0640 /etc/subgate/config.json
 ```
 
-It runs as a `DynamicUser` with `ProtectSystem=strict` and
-`ReadOnlyPaths=/etc/subgate`, so the config cannot be modified by the service
-itself.
+### 2. Systemd Service
 
-Because `/etc/subgate` is read-only to the service, write the config as root and
-then reload.
+Copy `systemd/subgate.service` to `/etc/systemd/system/subgate.service`:
 
-## Source layout
+```bash
+cp target/release/subgate /usr/local/bin/subgate
+cp systemd/subgate.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now subgate
+```
 
-| File | Responsibility |
-|---|---|
-| `server.rs` | HTTP/1.1 framing: parse a request, write bytes |
-| `serialize.rs` | Response construction and header ordering |
-| `routes.rs` | Routing and per-request response decisions |
-| `condition.rs` | `If-*` evaluation |
-| `range.rs` | `Range` parsing and multipart bodies |
-| `stealth.rs` | HTTP dates and ETag derivation |
-| `errors.rs` | nginx built-in error pages |
-| `config.rs` | Load, index, and query the config |
-| `validate.rs` | Every rule that decides what a config may contain |
-| `model.rs` | `Node`, `Group`, `NodeRef`, `Format` |
-| `state.rs` | Live config slot and SIGHUP reload semantics |
-| `render/clash.rs` | Clash YAML |
-| `render/v2ray.rs` | base64 `vless://` subscription |
+### 3. Nginx Reverse Proxy
 
-Loading builds the node index first, then validates. That order keeps the
-reference check a hash lookup instead of a scan of the node table for every
-reference, which matters once a config carries thousands of nodes.
+Subgate is designed to sit behind an nginx reverse proxy listening on loopback (`127.0.0.1:8080`).
 
-Token comparison folds the length into the result rather than returning early
-on a length mismatch, so the number of rounds does not reveal the token's
-length. Every group is still compared, so a match's position is not observable
-either.
+See [`deploy/nginx.conf.example`](deploy/nginx.conf.example) for the complete configuration, including:
+- TLS 1.2/1.3 termination and HTTP/2.
+- Connection and rate limiting zones.
+- Backend keepalive pool (`keepalive 32; keepalive_timeout 60s;`).
+- Standard reverse-proxy header forwarding (`Host`, `X-Forwarded-For`).
 
-## Why no web framework
+## Upgrade and Rollback Procedure
 
-axum's `RouteFuture` unconditionally adds `Content-Length: 0` to empty-body
-responses, and hyper normalises header names to `Etag` and reorders them. Both
-are observable differences from real nginx, so request parsing and response
-serialisation are hand-written in `src/server.rs` and `src/serialize.rs`.
+### Upgrades
 
-TLS is terminated by a fronting nginx; subgate listens on `127.0.0.1` only.
+1. Build the release binary: `cargo build --release --locked`.
+2. Validate new binary against existing configuration:
+   ```bash
+   ./target/release/subgate --check /etc/subgate/config.json
+   ```
+3. Install binary:
+   ```bash
+   install -m 0755 target/release/subgate /usr/local/bin/subgate.new
+   mv /usr/local/bin/subgate.new /usr/local/bin/subgate
+   ```
+4. Restart service:
+   ```bash
+   systemctl restart subgate
+   ```
+5. Verify status and logs:
+   ```bash
+   systemctl status subgate
+   journalctl -u subgate -n 20
+   ```
+
+### Rollback
+
+1. Restore previous binary from backup or previous release:
+   ```bash
+   cp /usr/local/bin/subgate.bak /usr/local/bin/subgate
+   systemctl restart subgate
+   ```
+2. If configuration needs to be rolled back:
+   ```bash
+   cp /etc/subgate/config.json.bak /etc/subgate/config.json
+   systemctl reload subgate
+   ```

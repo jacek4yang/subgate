@@ -17,7 +17,7 @@ use crate::stealth;
 pub enum Precondition {
     Proceed,
     NotModified,
-    PreconditionFailed,
+    Failed,
 }
 
 /// Whether an `If-None-Match` entity-tag list matches `etag`.
@@ -55,14 +55,14 @@ pub fn evaluate(
     if let Some(v) = if_unmodified_since {
         if let Some(t) = stealth::parse_http_time(v) {
             if t < last_modified {
-                return Precondition::PreconditionFailed;
+                return Precondition::Failed;
             }
         }
     }
 
     if let Some(v) = if_match {
         if !etag_matches(v, etag) {
-            return Precondition::PreconditionFailed;
+            return Precondition::Failed;
         }
     }
 
@@ -129,7 +129,14 @@ mod tests {
     #[test]
     fn etag_list_matches() {
         assert_eq!(
-            evaluate(None, None, None, Some("\"a\", \"b\", \"6a46b751-267\""), LM, ETAG),
+            evaluate(
+                None,
+                None,
+                None,
+                Some("\"a\", \"b\", \"6a46b751-267\""),
+                LM,
+                ETAG
+            ),
             Precondition::NotModified
         );
     }
@@ -145,7 +152,14 @@ mod tests {
     #[test]
     fn if_modified_since_exact_gives_304() {
         assert_eq!(
-            evaluate(None, None, Some("Thu, 02 Jul 2026 19:09:05 GMT"), None, LM, ETAG),
+            evaluate(
+                None,
+                None,
+                Some("Thu, 02 Jul 2026 19:09:05 GMT"),
+                None,
+                LM,
+                ETAG
+            ),
             Precondition::NotModified
         );
     }
@@ -154,11 +168,25 @@ mod tests {
     fn if_modified_since_earlier_or_later_proceeds() {
         // Exact semantics: neither earlier nor later yields 304.
         assert_eq!(
-            evaluate(None, None, Some("Thu, 02 Jul 2026 19:09:04 GMT"), None, LM, ETAG),
+            evaluate(
+                None,
+                None,
+                Some("Thu, 02 Jul 2026 19:09:04 GMT"),
+                None,
+                LM,
+                ETAG
+            ),
             Precondition::Proceed
         );
         assert_eq!(
-            evaluate(None, None, Some("Thu, 02 Jul 2026 19:09:06 GMT"), None, LM, ETAG),
+            evaluate(
+                None,
+                None,
+                Some("Thu, 02 Jul 2026 19:09:06 GMT"),
+                None,
+                LM,
+                ETAG
+            ),
             Precondition::Proceed
         );
     }
@@ -167,22 +195,36 @@ mod tests {
     fn if_match_miss_gives_412() {
         assert_eq!(
             evaluate(None, Some("\"nope\""), None, None, LM, ETAG),
-            Precondition::PreconditionFailed
+            Precondition::Failed
         );
     }
 
     #[test]
     fn if_unmodified_since_older_gives_412() {
         assert_eq!(
-            evaluate(Some("Thu, 02 Jul 2026 19:09:04 GMT"), None, None, None, LM, ETAG),
-            Precondition::PreconditionFailed
+            evaluate(
+                Some("Thu, 02 Jul 2026 19:09:04 GMT"),
+                None,
+                None,
+                None,
+                LM,
+                ETAG
+            ),
+            Precondition::Failed
         );
     }
 
     #[test]
     fn if_unmodified_since_equal_proceeds() {
         assert_eq!(
-            evaluate(Some("Thu, 02 Jul 2026 19:09:05 GMT"), None, None, None, LM, ETAG),
+            evaluate(
+                Some("Thu, 02 Jul 2026 19:09:05 GMT"),
+                None,
+                None,
+                None,
+                LM,
+                ETAG
+            ),
             Precondition::Proceed
         );
     }

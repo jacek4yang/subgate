@@ -49,6 +49,17 @@ fn default_server_token() -> String {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self, String> {
+        // Bound the read: a config file is a few kilobytes, so anything
+        // larger is a mistake (or an attack).
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("failed to read config {}: {e}", path.display()))?;
+        let size = file
+            .metadata()
+            .map_err(|e| format!("failed to read config {}: {e}", path.display()))?
+            .len();
+        if size > 1024 * 1024 {
+            return Err(format!("config file exceeds 1 MiB: {}", path.display()));
+        }
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read config {}: {e}", path.display()))?;
 
@@ -75,7 +86,6 @@ impl Config {
     }
 
     /// Resolve a node name to its definition.
-    #[allow(dead_code)]
     pub fn node(&self, name: &str) -> Option<&Node> {
         self.node_index.get(name).map(|i| &self.nodes[*i])
     }
@@ -85,7 +95,6 @@ impl Config {
     ///
     /// References are guaranteed to resolve because validation runs before the
     /// index is built, so a missing entry cannot occur here.
-    #[allow(dead_code)]
     pub fn group_nodes<'a>(&'a self, group: &'a Group) -> Vec<(&'a Node, &'a str)> {
         group
             .nodes
@@ -102,7 +111,6 @@ impl Config {
     /// All groups are scanned even after a match so the comparison cost does
     /// not depend on the token's position in the list. Called from the routing
     /// layer in a later change.
-    #[allow(dead_code)]
     pub fn group_for_token(&self, token: &str) -> Option<&Group> {
         let mut found = None;
         for group in &self.groups {
@@ -154,7 +162,9 @@ mod tests {
     #[test]
     fn invalid_json_is_error() {
         let p = write_temp("bad.json", "{");
-        assert!(Config::load(&p).unwrap_err().contains("failed to parse config"));
+        assert!(Config::load(&p)
+            .unwrap_err()
+            .contains("failed to parse config"));
     }
 
     #[test]

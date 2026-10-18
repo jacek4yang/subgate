@@ -10,18 +10,6 @@ use serde::{Deserialize, Deserializer};
 
 use std::fmt;
 
-/// Where a subscription's nodes live.
-///
-/// Consumed by the renderers in a later change; the type is defined here so the
-/// URL shape is fixed in one place.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Format {
-    Clash,
-    V2ray,
-}
-
 /// A published subscription.
 ///
 /// `nodes` holds **references**, not node definitions. The order is the order
@@ -122,7 +110,6 @@ impl<'de> Deserialize<'de> for NodeRef {
 
 /// The client-tuning fields are only read by the renderers, which arrive in a
 /// later change.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Node {
@@ -171,7 +158,6 @@ fn default_alpn() -> Vec<String> {
     vec!["h2".to_string(), "http/1.1".to_string()]
 }
 
-#[allow(dead_code)]
 impl Group {
     /// Whether `token` matches this group, compared in constant time.
     ///
@@ -186,7 +172,7 @@ impl Group {
         // Length is folded into the result instead of short-circuiting, so the
         // loop always runs the same number of rounds. Returning early on a
         // length mismatch would leak the token's length.
-        let mut diff = (a.len() ^ b.len()) as u8;
+        let mut diff = if a.len() == b.len() { 0u8 } else { 1u8 };
 
         // Compare up to the longer of the two, treating any byte past the end
         // of either side as a mismatch. This keeps the work independent of
@@ -294,7 +280,10 @@ mod tests {
 
     #[test]
     fn unknown_node_field_is_rejected() {
-        let bad = MINIMAL.replace(r#""public-key": "PUBKEY""#, r#""public-key": "PUBKEY", "junk": 1"#);
+        let bad = MINIMAL.replace(
+            r#""public-key": "PUBKEY""#,
+            r#""public-key": "PUBKEY", "junk": 1"#,
+        );
         assert!(parse_node(&bad).is_err());
     }
 
@@ -380,18 +369,7 @@ mod tests {
         assert!(!g.token_matches("abc12"));
         assert!(!g.token_matches("abc1234"));
         assert!(!g.token_matches(""));
-    }
-
-    #[test]
-    fn format_parses_from_lowercase() {
-        assert_eq!(
-            serde_json::from_str::<Format>(r#""clash""#).unwrap(),
-            Format::Clash
-        );
-        assert_eq!(
-            serde_json::from_str::<Format>(r#""v2ray""#).unwrap(),
-            Format::V2ray
-        );
-        assert!(serde_json::from_str::<Format>(r#""singbox""#).is_err());
+        let big = "a".repeat(262); // 6 + 256
+        assert!(!g.token_matches(&big));
     }
 }

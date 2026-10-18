@@ -7,11 +7,14 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/subgate /etc/subgate/config.json
+# Fail `systemctl reload` before the HUP if the new config is invalid.
+ExecReload=/usr/local/bin/subgate --check /etc/subgate/config.json
 ExecReload=/bin/kill -HUP $MAINPID
-Restart=always
+Restart=on-failure
 RestartSec=3
-
+TimeoutStopSec=15
 DynamicUser=yes
+SupplementaryGroups=subgate
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -24,6 +27,13 @@ RestrictAddressFamilies=AF_INET AF_INET6
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
+MemoryMax=256M
+TaskMax=512
+LimitNOFILE=16384
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+RemoveIPC=yes
 ReadOnlyPaths=/etc/subgate
 
 [Install]

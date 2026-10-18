@@ -116,7 +116,7 @@ fn yaml_str(s: &str) -> String {
     s.to_string()
 }
 
-fn needs_quotes(s: &str) -> bool {
+pub(crate) fn needs_quotes(s: &str) -> bool {
     if s.is_empty() {
         return true;
     }
@@ -180,7 +180,7 @@ mod tests {
             address: "example.com".to_string(),
             port: 443,
             uuid: "11111111-2222-3333-4444-555555555555".to_string(),
-            public_key: "PUBKEY".to_string(),
+            public_key: "bK4PTQX5dwqSdVBzADrqhPtALBwj9b0uYjYR29lS4xE".to_string(),
             short_id: "0123456789abcdef".to_string(),
             server_name: "www.example.com".to_string(),
             flow: "xtls-rprx-vision".to_string(),
@@ -192,13 +192,19 @@ mod tests {
 
     fn config(nodes: Vec<Node>, refs: Vec<&str>) -> Config {
         let json = format!(
-            r#"{{"listen":"127.0.0.1:1","nodes":{},"groups":[{{"token":"t","name":"main","nodes":{}}}]}}"#,
-            serde_json::to_string(&nodes.iter().map(|n| serde_json::json!({
-                "name": n.name, "address": n.address, "port": n.port, "uuid": n.uuid,
-                "public-key": n.public_key, "short-id": n.short_id,
-                "server-name": n.server_name, "flow": n.flow,
-                "fingerprint": n.fingerprint, "alpn": n.alpn,
-            })).collect::<Vec<_>>()).unwrap(),
+            r#"{{"listen":"127.0.0.1:1","nodes":{},"groups":[{{"token":"t-0123456789abcdef","name":"main","nodes":{}}}]}}"#,
+            serde_json::to_string(
+                &nodes
+                    .iter()
+                    .map(|n| serde_json::json!({
+                        "name": n.name, "address": n.address, "port": n.port, "uuid": n.uuid,
+                        "public-key": n.public_key, "short-id": n.short_id,
+                        "server-name": n.server_name, "flow": n.flow,
+                        "fingerprint": n.fingerprint, "alpn": n.alpn,
+                    }))
+                    .collect::<Vec<_>>()
+            )
+            .unwrap(),
             serde_json::to_string(&refs).unwrap()
         );
         let dir = std::env::temp_dir().join("subgate-clash-tests");
@@ -219,7 +225,7 @@ mod tests {
         assert!(out.contains("server: example.com"));
         assert!(out.contains("port: 443"));
         assert!(out.contains("servername: www.example.com"));
-        assert!(out.contains("public-key: PUBKEY"));
+        assert!(out.contains("public-key: bK4PTQX5dwqSdVBzADrqhPtALBwj9b0uYjYR29lS4xE"));
         assert!(out.contains("short-id: 0123456789abcdef"));
         assert!(out.contains("flow: xtls-rprx-vision"));
         assert!(out.contains("client-fingerprint: chrome"));
@@ -267,5 +273,39 @@ mod tests {
         assert_eq!(yaml_str("null"), "\"null\"");
         assert_eq!(yaml_str("true"), "\"true\"");
         assert_eq!(yaml_str(""), "\"\"");
+    }
+
+    #[test]
+    fn match_rule_uses_raw_group_name() {
+        let cfg = config(vec![node("hk-1")], vec!["hk-1"]);
+        let out = render(&cfg, &cfg.groups[0]);
+        assert!(out.contains("rules:\n  - MATCH,main\n"));
+    }
+
+    #[test]
+    fn empty_group_keeps_match_rule() {
+        let cfg = config(vec![], vec![]);
+        let out = render(&cfg, &cfg.groups[0]);
+        assert!(out.contains("proxies:\n  []"));
+        assert!(out.contains("proxies:\n      []"));
+        assert!(out.contains("rules:\n  - MATCH,main\n"));
+    }
+
+    #[test]
+    fn quoted_group_name_fails_validation() {
+        // A group name needing quotes (e.g. `a: b`) must be rejected at load
+        // so the raw MATCH line can never corrupt the profile.
+        let dir = std::env::temp_dir().join("subgate-clash-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        static SEQ2: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1000);
+        let n = SEQ2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!("q{n}.json"));
+        std::fs::write(
+            &path,
+            r#"{"listen":"127.0.0.1:1","nodes":[],"groups":[{"token":"q1234567890123456","name":"a: b","nodes":[]}]}"#,
+        )
+        .unwrap();
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.contains("MATCH rule"), "{err}");
     }
 }

@@ -42,6 +42,11 @@ pub fn page_416(token: &str) -> String {
     page("416 Requested Range Not Satisfiable", token)
 }
 
+/// nginx calls the status `413 Request Entity Too Large`.
+pub fn page_413(token: &str) -> String {
+    page("413 Request Entity Too Large", token)
+}
+
 pub fn page_503(token: &str) -> String {
     page("503 Service Temporarily Unavailable", token)
 }

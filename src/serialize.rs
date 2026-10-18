@@ -62,7 +62,6 @@ impl Response {
         }
         out
     }
-
 }
 
 #[cfg(test)]
@@ -85,10 +84,7 @@ mod tests {
     #[test]
     fn head_only_omits_body() {
         let r = Response::new(404, "Not Found").body("x");
-        assert_eq!(
-            r.into_bytes(false),
-            b"HTTP/1.1 404 Not Found\r\n\r\n"
-        );
+        assert_eq!(r.into_bytes(false), b"HTTP/1.1 404 Not Found\r\n\r\n");
     }
 
     #[test]
