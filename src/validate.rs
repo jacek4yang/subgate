@@ -50,10 +50,7 @@ pub fn validate_nodes(cfg: &Config) -> Result<(), String> {
             ("server-name", &node.server_name),
         ] {
             if value.trim().is_empty() {
-                return Err(format!(
-                    "node {:?}: {label} must not be empty",
-                    node.name
-                ));
+                return Err(format!("node {:?}: {label} must not be empty", node.name));
             }
             if value.chars().any(|c| c.is_control()) {
                 return Err(format!(
@@ -103,6 +100,66 @@ pub fn validate_nodes(cfg: &Config) -> Result<(), String> {
             return Err(format!("node {:?}: port must not be 0", node.name));
         }
 
+        // Semantic checks for Reality-specific fields.
+        if !is_valid_uuid(&node.uuid) {
+            return Err(format!(
+                "node {:?}: uuid must be in 8-4-4-4-12 hex format",
+                node.name
+            ));
+        }
+
+        let pk = node
+            .public_key
+            .strip_suffix('=')
+            .unwrap_or(&node.public_key);
+        match decode_base64(pk) {
+            Some(bytes) if bytes.len() == 32 => {}
+            Some(bytes) => {
+                return Err(format!(
+                    "node {:?}: public-key must decode to 32 bytes (got {}); generate with: x25519 | grep secret | cut -d ' ' -f 2",
+                    node.name,
+                    bytes.len()
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "node {:?}: public-key must be base64url-encoded",
+                    node.name
+                ));
+            }
+        }
+
+        if !node.short_id.is_empty()
+            && (node.short_id.len() > 16
+                || node.short_id.len() % 2 != 0
+                || !node.short_id.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(format!(
+                "node {:?}: short-id must be hex with even length up to 16 characters",
+                node.name
+            ));
+        }
+
+        if node
+            .address
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '/' | '@' | '?' | '#'))
+        {
+            return Err(format!(
+                "node {:?}: address must be a valid host or IP address without whitespace, '/', '@', '?' or '#'",
+                node.name
+            ));
+        }
+        if node.server_name.chars().any(|c| c.is_whitespace())
+            || node.server_name.contains('/')
+            || node.server_name.contains(':')
+        {
+            return Err(format!(
+                "node {:?}: server-name must be a hostname without whitespace, '/' or ':'",
+                node.name
+            ));
+        }
+
         if !names.insert(&node.name) {
             return Err(format!("duplicate node name {:?}", node.name));
         }
@@ -118,18 +175,26 @@ pub fn validate_groups(cfg: &Config) -> Result<(), String> {
     let mut seen = HashSet::new();
 
     for group in &cfg.groups {
-        validate_token(&group.token)?;
+        validate_token(&group.token, &group.name)?;
 
         if !tokens.insert(&group.token) {
-            return Err(format!("duplicate token {:?}", group.token));
+            return Err(format!("group {:?}: duplicate token", group.name));
         }
         if group.name.trim().is_empty() {
-            return Err(format!("group with token {:?}: name must not be empty", group.token));
+            return Err("group name must not be empty".into());
         }
         if group.name.chars().any(|c| c.is_control()) {
             return Err(format!(
                 "group {:?}: name must not contain control characters",
                 group.name
+            ));
+        }
+        // The group name is written raw into the `MATCH,<name>` rule, so a
+        // comma or YAML-sensitive character would corrupt the profile.
+        if group.name.contains(',') || crate::render::clash::needs_quotes(&group.name) {
+            return Err(format!(
+                "group {name:?}: name cannot be used in a MATCH rule (contains ',' or YAML-sensitive characters)",
+                name = group.name
             ));
         }
         if !group_names.insert(&group.name) {
@@ -139,17 +204,21 @@ pub fn validate_groups(cfg: &Config) -> Result<(), String> {
         // Every reference must resolve, and a group must not publish the
         // same node twice.
         seen.clear();
+        let mut display_names = HashSet::new();
         for r in &group.nodes {
             let name = &r.reference;
             if name.is_empty() {
-                return Err(format!("group {:?}: node reference must not be empty", group.name));
-            }
-            if !cfg.node_index.contains_key(name) {
                 return Err(format!(
-                    "group {:?}: unknown node {name:?}",
+                    "group {:?}: node reference must not be empty",
                     group.name
                 ));
             }
+            let node = match cfg.node_index.get(name) {
+                Some(i) => &cfg.nodes[*i],
+                None => {
+                    return Err(format!("group {:?}: unknown node {name:?}", group.name));
+                }
+            };
             if !seen.insert(name) {
                 return Err(format!(
                     "group {:?}: node {name:?} listed twice",
@@ -171,6 +240,16 @@ pub fn validate_groups(cfg: &Config) -> Result<(), String> {
                     ));
                 }
             }
+
+            // Duplicate display names within a group would render two
+            // indistinguishable proxies in the client.
+            if !display_names.insert(r.display_name(node)) {
+                return Err(format!(
+                    "group {:?}: duplicate display name {:?}",
+                    group.name,
+                    r.display_name(node)
+                ));
+            }
         }
     }
 
@@ -179,9 +258,9 @@ pub fn validate_groups(cfg: &Config) -> Result<(), String> {
 
 /// A token becomes a URL path segment, so it must survive both a raw and a
 /// percent-decoded interpretation unchanged.
-fn validate_token(token: &str) -> Result<(), String> {
+fn validate_token(token: &str, group_name: &str) -> Result<(), String> {
     if token.is_empty() {
-        return Err("token must not be empty".into());
+        return Err(format!("group {group_name:?}: token must not be empty"));
     }
 
     let valid = token
@@ -190,16 +269,73 @@ fn validate_token(token: &str) -> Result<(), String> {
 
     if !valid {
         return Err(format!(
-            "token {token:?} must contain only ASCII letters, digits, '-' and '_'"
+            "group {group_name:?}: token must contain only ASCII letters, digits, '-' and '_'"
+        ));
+    }
+
+    if token.len() < 16 || token.len() > 128 {
+        return Err(format!(
+            "group {group_name:?}: token length must be between 16 and 128 characters (too short or too long; generate with: openssl rand -base64 24 | tr '+/' '-_' | tr -d '=')"
         ));
     }
 
     Ok(())
 }
 
+/// 8-4-4-4-12 hex groups.
+fn is_valid_uuid(s: &str) -> bool {
+    let groups: Vec<&str> = s.split('-').collect();
+    if groups.len() != 5 {
+        return false;
+    }
+    let expected = [8, 4, 4, 4, 12];
+    for (g, want) in groups.iter().zip(expected) {
+        if g.len() != want || !g.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Decode standard/base64url (trailing `=` padding allowed). Returns `None`
+/// on invalid input.
+fn decode_base64(s: &str) -> Option<Vec<u8>> {
+    let mut vals = Vec::with_capacity(s.len());
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => continue,
+            _ => return None,
+        };
+        vals.push(v);
+    }
+    let mut out = Vec::with_capacity(vals.len() * 3 / 4);
+    for chunk in vals.chunks(4) {
+        match chunk.len() {
+            4 => {
+                out.push((chunk[0] << 2) | (chunk[1] >> 4));
+                out.push(((chunk[1] & 0x0f) << 4) | (chunk[2] >> 2));
+                out.push(((chunk[2] & 0x03) << 6) | chunk[3]);
+            }
+            3 => {
+                out.push((chunk[0] << 2) | (chunk[1] >> 4));
+                out.push(((chunk[1] & 0x0f) << 4) | (chunk[2] >> 2));
+            }
+            2 => {
+                out.push((chunk[0] << 2) | (chunk[1] >> 4));
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::config::Config;
     use std::io::Write;
 
@@ -220,9 +356,18 @@ mod tests {
         Config::load(&p)
     }
 
+    /// Pad a short fixture name into a token that passes the 16-character
+    /// minimum, so tests can stay readable.
+    fn long(t: &str) -> String {
+        format!("{t}0123456789abcdef")
+    }
+
+    const SAMPLE_PUBKEY: &str = "bK4PTQX5dwqSdVBzADrqhPtALBwj9b0uYjYR29lS4xE";
+    const SAMPLE_UUID: &str = "11111111-2222-3333-4444-555555555555";
+
     fn node_json(name: &str) -> String {
         format!(
-            r#"{{"name":"{name}","address":"a","port":443,"uuid":"u","public-key":"k","short-id":"01","server-name":"sni.example"}}"#
+            r#"{{"name":"{name}","address":"a","port":443,"uuid":"{SAMPLE_UUID}","public-key":"{SAMPLE_PUBKEY}","short-id":"01","server-name":"sni.example"}}"#
         )
     }
 
@@ -232,7 +377,10 @@ mod tests {
             .map(|n| format!(r#""{n}""#))
             .collect::<Vec<_>>()
             .join(",");
-        format!(r#"{{"token":"{token}","name":"{name}","nodes":[{list}]}}"#)
+        format!(
+            r#"{{"token":"{}","name":"{name}","nodes":[{list}]}}"#,
+            long(token)
+        )
     }
 
     fn config_json(nodes: &[String], groups: &[String]) -> String {
@@ -254,11 +402,11 @@ mod tests {
     fn groups_parse_and_lookup_by_token() {
         let cfg = cfg_with(&one_group()).unwrap();
         assert_eq!(cfg.groups.len(), 1);
-        let g = cfg.group_for_token("abc123").unwrap();
+        let g = cfg.group_for_token(&long("abc123")).unwrap();
         assert_eq!(g.name, "main");
         assert_eq!(g.nodes.len(), 1);
         assert_eq!(g.nodes[0].reference, "hk-1");
-        assert!(cfg.group_for_token("abc124").is_none());
+        assert!(cfg.group_for_token(&long("abc124")).is_none());
     }
 
     #[test]
@@ -276,7 +424,7 @@ mod tests {
             &[group_json("t", "g", &["c", "a"])],
         ))
         .unwrap();
-        let g = cfg.group_for_token("t").unwrap();
+        let g = cfg.group_for_token(&long("t")).unwrap();
         let resolved: Vec<&str> = cfg.group_nodes(g).into_iter().map(|(_, d)| d).collect();
         assert_eq!(resolved, vec!["c", "a"]);
     }
@@ -311,14 +459,13 @@ mod tests {
             &[node_json("shared")],
             &[
                 group_json("t1", "g1", &["shared"]),
-                format!(
-                    r#"{{"token":"t2","name":"g2","nodes":[{{"ref":"shared","name":"Backup Line"}}]}}"#
-                ),
+                r#"{"token":"t2-0123456789abcdef","name":"g2","nodes":[{"ref":"shared","name":"Backup Line"}]}"#
+                    .to_string(),
             ],
         );
         let cfg = cfg_with(&body).unwrap();
-        let g1 = cfg.group_for_token("t1").unwrap();
-        let g2 = cfg.group_for_token("t2").unwrap();
+        let g1 = cfg.group_for_token(&long("t1")).unwrap();
+        let g2 = cfg.group_for_token("t2-0123456789abcdef").unwrap();
 
         let d1: Vec<&str> = cfg.group_nodes(g1).into_iter().map(|(_, d)| d).collect();
         let d2: Vec<&str> = cfg.group_nodes(g2).into_iter().map(|(_, d)| d).collect();
@@ -330,7 +477,10 @@ mod tests {
     fn empty_display_name_is_rejected() {
         let body = config_json(
             &[node_json("a")],
-            &[r#"{"token":"t","name":"g","nodes":[{"ref":"a","name":"  "}]}"#.to_string()],
+            &[
+                r#"{"token":"t-0123456789abcdef","name":"g","nodes":[{"ref":"a","name":"  "}]}"#
+                    .to_string(),
+            ],
         );
         let err = cfg_with(&body).unwrap_err();
         assert!(err.contains("display name must not be empty"), "{err}");
@@ -342,7 +492,7 @@ mod tests {
         // still the same node, so listing both must be rejected.
         let body = config_json(
             &[node_json("a")],
-            &[r#"{"token":"t","name":"g","nodes":["a",{"ref":"a","name":"Other"}]}"#.to_string()],
+            &[r#"{"token":"t-0123456789abcdef","name":"g","nodes":["a",{"ref":"a","name":"Other"}]}"#.to_string()],
         );
         let err = cfg_with(&body).unwrap_err();
         assert!(err.contains("listed twice"), "{err}");
@@ -350,7 +500,10 @@ mod tests {
 
     #[test]
     fn unknown_node_reference_is_rejected() {
-        let body = config_json(&[node_json("a")], &[group_json("t", "g", &["a", "missing"])]);
+        let body = config_json(
+            &[node_json("a")],
+            &[group_json("t", "g", &["a", "missing"])],
+        );
         let err = cfg_with(&body).unwrap_err();
         assert!(err.contains(r#"unknown node "missing""#), "{err}");
     }
@@ -376,7 +529,10 @@ mod tests {
     fn duplicate_token_is_rejected() {
         let body = config_json(
             &[node_json("a")],
-            &[group_json("abc123", "a", &[]), group_json("abc123", "b", &[])],
+            &[
+                group_json("abc123", "a", &[]),
+                group_json("abc123", "b", &[]),
+            ],
         );
         let err = cfg_with(&body).unwrap_err();
         assert!(err.contains("duplicate token"), "{err}");
@@ -386,7 +542,10 @@ mod tests {
     fn duplicate_group_name_is_rejected() {
         let body = config_json(
             &[node_json("a")],
-            &[group_json("abc123", "main", &[]), group_json("def456", "main", &[])],
+            &[
+                group_json("abc123", "main", &[]),
+                group_json("def456", "main", &[]),
+            ],
         );
         let err = cfg_with(&body).unwrap_err();
         assert!(err.contains("duplicate group name"), "{err}");
@@ -401,7 +560,7 @@ mod tests {
 
     #[test]
     fn empty_token_is_rejected() {
-        let body = config_json(&[], &[group_json("", "g", &[])]);
+        let body = config_json(&[], &[r#"{"token":"","name":"g","nodes":[]}"#.to_string()]);
         assert!(cfg_with(&body).is_err());
     }
 
@@ -417,16 +576,13 @@ mod tests {
 
     #[test]
     fn empty_node_field_is_rejected() {
-        let body = config_json(
-            &[node_json("a").replace(r#""uuid":"u""#, r#""uuid":"  ""#)],
-            &[],
-        );
+        let body = config_json(&[node_json("a").replace(SAMPLE_UUID, r#"{"blank""#)], &[]);
         assert!(cfg_with(&body).is_err());
     }
 
     fn node_with(extra: &str) -> String {
         format!(
-            r#"{{"name":"a","address":"x","port":443,"uuid":"u","public-key":"k","short-id":"01","server-name":"sni.example"{extra}}}"#
+            r#"{{"name":"a","address":"x","port":443,"uuid":"{SAMPLE_UUID}","public-key":"{SAMPLE_PUBKEY}","short-id":"01","server-name":"sni.example"{extra}}}"#
         )
     }
 
@@ -436,8 +592,8 @@ mod tests {
         // newline would corrupt the output.
         let cases = [
             node_json("a").replace(r#""address":"a""#, r#""address":"a\nb""#),
-            node_json("a").replace(r#""uuid":"u""#, r#""uuid":"u\r""#),
-            node_json("a").replace(r#""public-key":"k""#, r#""public-key":"k\u0000""#),
+            node_json("a").replace(SAMPLE_UUID, "u\r11111111-2222-3333-4444"),
+            node_json("a").replace(SAMPLE_PUBKEY, "k\u{0}0000000000000000000000000000000"),
             node_with(r#","short-id":"a\tb""#),
             node_with(r#","server-name":"a\nb""#),
             node_with(r#","spider-x":"/\n""#),
@@ -445,19 +601,22 @@ mod tests {
             node_json("a").replace(r#""name":"a""#, r#""name":"a\nb""#),
         ];
         for node in cases {
-            let body = config_json(&[node.clone()], &[]);
+            let body = config_json(std::slice::from_ref(&node), &[]);
             assert!(cfg_with(&body).is_err(), "accepted {node}");
         }
 
         let body = config_json(
             &[node_json("a")],
-            &[r#"{"token":"t","name":"g\nh","nodes":[]}"#.to_string()],
+            &[r#"{"token":"t-0123456789abcdef","name":"g\nh","nodes":[]}"#.to_string()],
         );
         assert!(cfg_with(&body).is_err());
 
         let body = config_json(
             &[node_json("a")],
-            &[r#"{"token":"t","name":"g","nodes":[{"ref":"a","name":"x\ny"}]}"#.to_string()],
+            &[
+                r#"{"token":"t-0123456789abcdef","name":"g","nodes":[{"ref":"a","name":"x\ny"}]}"#
+                    .to_string(),
+            ],
         );
         assert!(cfg_with(&body).is_err());
     }
@@ -485,10 +644,7 @@ mod tests {
 
     #[test]
     fn missing_short_id_key_is_rejected() {
-        let body = config_json(
-            &[node_json("a").replace(r#","short-id":"01""#, "")],
-            &[],
-        );
+        let body = config_json(&[node_json("a").replace(r#","short-id":"01""#, "")], &[]);
         assert!(cfg_with(&body).is_err());
     }
 
@@ -510,7 +666,10 @@ mod tests {
 
     #[test]
     fn empty_node_reference_is_rejected() {
-        let body = config_json(&[], &[r#"{"token":"t","name":"g","nodes":[""]}"#.to_string()]);
+        let body = config_json(
+            &[],
+            &[r#"{"token":"t-0123456789abcdef","name":"g","nodes":[""]}"#.to_string()],
+        );
         let err = cfg_with(&body).unwrap_err();
         assert!(err.contains("node reference must not be empty"), "{err}");
     }
@@ -526,7 +685,7 @@ mod tests {
 
         // An empty short-id means the server does no shortId matching.
         let body = config_json(
-            &[r#"{"name":"a","address":"x","port":443,"uuid":"u","public-key":"k","short-id":"","server-name":"sni.example"}"#.to_string()],
+            &[node_json("a").replace(r#""short-id":"01""#, r#""short-id":"""#)],
             &[],
         );
         assert!(cfg_with(&body).is_ok());
@@ -551,7 +710,7 @@ mod tests {
     fn unknown_group_field_is_rejected() {
         let body = config_json(
             &[],
-            &[r#"{"token":"t","name":"g","junk":1}"#.to_string()],
+            &[r#"{"token":"t-0123456789abcdef","name":"g","junk":1}"#.to_string()],
         );
         assert!(cfg_with(&body).is_err());
     }
@@ -565,7 +724,9 @@ mod tests {
         let nodes: Vec<String> = (0..2000).map(|i| node_json(&format!("n{i}"))).collect();
         let groups: Vec<String> = (0..200)
             .map(|g| {
-                let refs: Vec<String> = (0..20).map(|i| format!("n{}", (g * 7 + i) % 2000)).collect();
+                let refs: Vec<String> = (0..20)
+                    .map(|i| format!("n{}", (g * 7 + i) % 2000))
+                    .collect();
                 let list: Vec<&str> = refs.iter().map(|s| s.as_str()).collect();
                 group_json(&format!("t{g}"), &format!("g{g}"), &list)
             })
@@ -587,5 +748,125 @@ mod tests {
             r#"{"listen":"127.0.0.1:1","server_token":"nginx\r\nX: y"}"#,
         );
         assert!(Config::load(&p).unwrap_err().contains("invalid characters"));
+    }
+
+    #[test]
+    fn short_token_is_rejected() {
+        let body = config_json(
+            &[node_json("a")],
+            &[r#"{"token":"short","name":"g","nodes":["a"]}"#.to_string()],
+        );
+        let err = cfg_with(&body).unwrap_err();
+        assert!(err.contains("too short"), "{err}");
+    }
+
+    #[test]
+    fn token_at_minimum_length_is_accepted() {
+        let raw = config_json(
+            &[node_json("a")],
+            &[r#"{"token":"0123456789abcdef","name":"g","nodes":["a"]}"#.to_string()],
+        );
+        assert!(cfg_with(&raw).is_ok());
+    }
+
+    #[test]
+    fn malformed_uuid_is_rejected() {
+        for bad in [
+            "u",
+            "not-a-uuid",
+            "11111111-2222-3333-4444-zzzzzzzzzzzz",
+            "11111111222233334444555555555555",
+        ] {
+            let body = config_json(
+                &[node_json("a").replace("11111111-2222-3333-4444-555555555555", bad)],
+                &[],
+            );
+            assert!(cfg_with(&body).is_err(), "accepted uuid {bad:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_public_key_is_rejected() {
+        let body = config_json(
+            &[node_json("a").replace("bK4PTQX5dwqSdVBzADrqhPtALBwj9b0uYjYR29lS4xE", "QUJD")],
+            &[],
+        );
+        assert!(cfg_with(&body).is_err());
+        let body = config_json(
+            &[node_json("a").replace(
+                "bK4PTQX5dwqSdVBzADrqhPtALBwj9b0uYjYR29lS4xE",
+                "!!!not-base64!!!000000000000000000000000",
+            )],
+            &[],
+        );
+        assert!(cfg_with(&body).is_err());
+    }
+
+    #[test]
+    fn malformed_short_id_is_rejected() {
+        for bad in ["abc", "zz", "0123456789abcdef01", "0x12"] {
+            let body = config_json(
+                &[node_json("a").replace(r#""short-id":"01""#, &format!(r#""short-id":"{bad}""#))],
+                &[],
+            );
+            assert!(cfg_with(&body).is_err(), "accepted short-id {bad:?}");
+        }
+    }
+
+    #[test]
+    fn whitespace_address_and_bad_server_name_are_rejected() {
+        let body = config_json(
+            &[node_json("a").replace(r#""address":"a""#, r#""address":"a b""#)],
+            &[],
+        );
+        assert!(cfg_with(&body).is_err());
+        for bad in ["a b", "a/b", "a@b", "a?b", "a#b"] {
+            let body = config_json(
+                &[node_json("a").replace(r#""address":"a""#, &format!(r#""address":"{bad}""#))],
+                &[],
+            );
+            assert!(cfg_with(&body).is_err(), "accepted address {bad:?}");
+        }
+        for bad in ["a b", "a/b", "a:1"] {
+            let body = config_json(&[node_json("a").replace("sni.example", bad)], &[]);
+            assert!(cfg_with(&body).is_err(), "accepted server-name {bad:?}");
+        }
+    }
+
+    #[test]
+    fn overly_long_token_is_rejected() {
+        let long_token = "a".repeat(129);
+        let body = config_json(
+            &[node_json("a")],
+            &[r#"{"token":""#.to_string() + &long_token + r#"","name":"g","nodes":["a"]}"#],
+        );
+        let err = cfg_with(&body).unwrap_err();
+        assert!(err.contains("too short or too long"), "{err}");
+    }
+
+    #[test]
+    fn group_name_with_comma_or_yaml_chars_is_rejected() {
+        let body = config_json(
+            &[node_json("a")],
+            &[group_json("tok1234567890123", "a,b", &[])],
+        );
+        let err = cfg_with(&body).unwrap_err();
+        assert!(err.contains("MATCH rule"), "{err}");
+        let body = config_json(
+            &[node_json("a")],
+            &[group_json("tok1234567890124", "a: b", &[])],
+        );
+        let err = cfg_with(&body).unwrap_err();
+        assert!(err.contains("MATCH rule"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_display_name_within_group_is_rejected() {
+        let body = config_json(
+            &[node_json("a"), node_json("b")],
+            &[r#"{"token":"dup1-0123456789abcdef","name":"g","nodes":[{"ref":"a","name":"Same"},{"ref":"b","name":"Same"}]}"#.to_string()],
+        );
+        let err = cfg_with(&body).unwrap_err();
+        assert!(err.contains("duplicate display name"), "{err}");
     }
 }

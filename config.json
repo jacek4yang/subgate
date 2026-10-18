@@ -7,21 +7,21 @@
       "address": "example.com",
       "port": 443,
       "uuid": "00000000-0000-0000-0000-000000000000",
-      "public-key": "REPLACE_WITH_X25519_PUBLIC_KEY",
+      "public-key": "bK4PTQX5dwqSdVBzADrqhPtALBwj9b0uYjYR29lS4xE",
       "short-id": "0123456789abcdef",
       "server-name": "www.example.com"
     }
   ],
   "groups": [
     {
-      "token": "REPLACE_ME",
+      "token": "kQ7vT2xLm9pZr4sW8yB3nE6hJ5cD1fG0",
       "name": "main",
       "nodes": [
         "hk-1"
       ]
     },
     {
-      "token": "REPLACE_ME_TOO",
+      "token": "uX2wN8pQ4tK7vB1mZ5cR9dF3hJ6sL0aE",
       "name": "family",
       "nodes": [
         {

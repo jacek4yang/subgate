@@ -31,6 +31,8 @@ pub struct RequestView<'a> {
     pub version: &'a str,
     /// Header names are lowercased for easy lookup.
     pub headers: &'a [(String, String)],
+    /// When true (e.g. keepalive request limit reached), force Connection: close.
+    pub force_close: bool,
 }
 
 impl<'a> RequestView<'a> {
@@ -47,9 +49,17 @@ impl<'a> RequestView<'a> {
     /// `Connection: keep-alive`; HTTP/1.1 keeps it unless the client asks for
     /// `Connection: close`.
     pub fn wants_keepalive(&self) -> bool {
+        if self.force_close {
+            return false;
+        }
+
         let conn = self.header("connection").unwrap_or("");
-        let has_keepalive = conn.split(',').any(|t| t.trim().eq_ignore_ascii_case("keep-alive"));
-        let has_close = conn.split(',').any(|t| t.trim().eq_ignore_ascii_case("close"));
+        let has_keepalive = conn
+            .split(',')
+            .any(|t| t.trim().eq_ignore_ascii_case("keep-alive"));
+        let has_close = conn
+            .split(',')
+            .any(|t| t.trim().eq_ignore_ascii_case("close"));
 
         if has_close {
             return false;
@@ -74,6 +84,15 @@ impl<'a> RequestView<'a> {
 /// The 400 response for a malformed request; the connection closes after it.
 pub fn bad_request(cfg: &Config, body: &str) -> Response {
     leading(cfg, Response::new(400, "Bad Request"))
+        .header("Content-Type", "text/html")
+        .header("Content-Length", body.len().to_string())
+        .header("Connection", "close")
+        .body(body.as_bytes().to_vec())
+}
+
+/// The 413 for a body beyond the size bound; the connection closes after it.
+pub fn too_large_body(cfg: &Config, body: &str) -> Response {
+    leading(cfg, Response::new(413, "Request Entity Too Large"))
         .header("Content-Type", "text/html")
         .header("Content-Length", body.len().to_string())
         .header("Connection", "close")
@@ -116,10 +135,22 @@ pub fn handle(cfg: &Config, req: &RequestView<'_>) -> Response {
         }
         // nginx's static module returns 405 for POST and for anything outside
         // GET/HEAD/POST.
-        return error(cfg, req, (405, "Not Allowed"), errors::page_405(&cfg.server_token), head_only);
+        return error(
+            cfg,
+            req,
+            (405, "Not Allowed"),
+            errors::page_405(&cfg.server_token),
+            head_only,
+        );
     }
 
-    error(cfg, req, (404, "Not Found"), errors::page_404(&cfg.server_token), head_only)
+    error(
+        cfg,
+        req,
+        (404, "Not Found"),
+        errors::page_404(&cfg.server_token),
+        head_only,
+    )
 }
 
 /// The rendered body of `/<token>/clash` or `/<token>/v2ray`.
@@ -135,11 +166,28 @@ fn subscription(cfg: &Config, path: &str) -> Option<(String, &'static str)> {
         return None;
     }
 
+    // Guard against large or malformed token inputs causing disproportionate
+    // computation across groups: tokens are 16..=128 ASCII alphanumeric/dash/underscore.
+    if token.len() < 16
+        || token.len() > 128
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+
     let group = cfg.group_for_token(token)?;
 
     match format {
-        "clash" => Some((render::clash::render(cfg, group), "text/yaml; charset=utf-8")),
-        "v2ray" => Some((render::v2ray::render(cfg, group), "text/plain; charset=utf-8")),
+        "clash" => Some((
+            render::clash::render(cfg, group),
+            "text/yaml; charset=utf-8",
+        )),
+        "v2ray" => Some((
+            render::v2ray::render(cfg, group),
+            "text/plain; charset=utf-8",
+        )),
         _ => None,
     }
 }
@@ -161,7 +209,11 @@ fn subscription_response(
         .header("Content-Length", len.to_string())
         .header("Connection", req.connection_value())
         .header("Cache-Control", "no-store")
-        .body(if head_only { Vec::new() } else { body.into_bytes() })
+        .body(if head_only {
+            Vec::new()
+        } else {
+            body.into_bytes()
+        })
 }
 
 /// The first half of nginx's fixed headers: `Server` and `Date`.
@@ -190,7 +242,7 @@ fn home(cfg: &Config, req: &RequestView<'_>, head_only: bool) -> Response {
                 .header("Connection", req.connection_value())
                 .header("ETag", etag);
         }
-        Precondition::PreconditionFailed => {
+        Precondition::Failed => {
             let body = errors::page_400(&cfg.server_token);
             return error(cfg, req, (412, "Precondition Failed"), body, head_only);
         }
@@ -215,7 +267,7 @@ fn home(cfg: &Config, req: &RequestView<'_>, head_only: bool) -> Response {
     match outcome {
         Outcome::Single { start, end } => {
             let len = end - start;
-            let body = assets::INDEX_HTML[start..end].as_bytes().to_vec();
+            let body = assets::INDEX_HTML.as_bytes()[start..end].to_vec();
             leading(cfg, Response::new(206, "Partial Content"))
                 .header("Content-Type", "text/html")
                 .header("Content-Length", len.to_string())
@@ -248,22 +300,24 @@ fn home(cfg: &Config, req: &RequestView<'_>, head_only: bool) -> Response {
                 .header("Content-Length", len.to_string())
                 .header("Connection", req.connection_value())
                 .header("Content-Range", format!("bytes */{}", assets::INDEX_SIZE))
-                .body(if head_only { Vec::new() } else { body.into_bytes() })
-        }
-        Outcome::Full => {
-            leading(cfg, Response::new(200, "OK"))
-                .header("Content-Type", "text/html")
-                .header("Content-Length", assets::INDEX_SIZE.to_string())
-                .header("Last-Modified", stealth::index_last_modified())
-                .header("Connection", req.connection_value())
-                .header("ETag", etag)
-                .header("Accept-Ranges", "bytes")
                 .body(if head_only {
                     Vec::new()
                 } else {
-                    assets::INDEX_HTML.as_bytes().to_vec()
+                    body.into_bytes()
                 })
         }
+        Outcome::Full => leading(cfg, Response::new(200, "OK"))
+            .header("Content-Type", "text/html")
+            .header("Content-Length", assets::INDEX_SIZE.to_string())
+            .header("Last-Modified", stealth::index_last_modified())
+            .header("Connection", req.connection_value())
+            .header("ETag", etag)
+            .header("Accept-Ranges", "bytes")
+            .body(if head_only {
+                Vec::new()
+            } else {
+                assets::INDEX_HTML.as_bytes().to_vec()
+            }),
     }
 }
 
@@ -308,6 +362,7 @@ mod tests {
             path,
             version: "HTTP/1.1",
             headers,
+            force_close: false,
         }
     }
 
@@ -337,7 +392,10 @@ mod tests {
                 continue;
             }
             if line.starts_with("Last-Modified: ") {
-                assert_eq!(g, format!("Last-Modified: {}", stealth::index_last_modified()));
+                assert_eq!(
+                    g,
+                    format!("Last-Modified: {}", stealth::index_last_modified())
+                );
                 continue;
             }
             if line.starts_with("ETag: ") {
@@ -350,7 +408,9 @@ mod tests {
         let rest: String = got.collect::<Vec<_>>().join("\n");
         assert_eq!(
             rest,
-            body.trim_end_matches("\r\n").trim_end().replace("\r\n", "\n")
+            body.trim_end_matches("\r\n")
+                .trim_end()
+                .replace("\r\n", "\n")
         );
     }
 
@@ -478,10 +538,10 @@ mod tests {
                 "nodes": [{
                     "name": "hk-1", "address": "example.com", "port": 443,
                     "uuid": "11111111-2222-3333-4444-555555555555",
-                    "public-key": "PUBKEY", "short-id": "ab",
+                    "public-key": "bK4PTQX5dwqSdVBzADrqhPtALBwj9b0uYjYR29lS4xE", "short-id": "ab",
                     "server-name": "www.example.com"
                 }],
-                "groups": [{"token": "secret123", "name": "main", "nodes": ["hk-1"]}]
+                "groups": [{"token": "secret123-0123456789", "name": "main", "nodes": ["hk-1"]}]
             }"#,
         )
         .unwrap();
@@ -490,7 +550,10 @@ mod tests {
 
     #[test]
     fn clash_endpoint_serves_yaml() {
-        let out = text(handle(&sub_cfg(), &req("GET", "/secret123/clash", &[])), true);
+        let out = text(
+            handle(&sub_cfg(), &req("GET", "/secret123-0123456789/clash", &[])),
+            true,
+        );
         assert!(out.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(out.contains("Content-Type: text/yaml; charset=utf-8\r\n"));
         assert!(out.contains("Cache-Control: no-store\r\n"));
@@ -500,13 +563,18 @@ mod tests {
 
     #[test]
     fn v2ray_endpoint_serves_base64() {
-        let out = text(handle(&sub_cfg(), &req("GET", "/secret123/v2ray", &[])), true);
+        let out = text(
+            handle(&sub_cfg(), &req("GET", "/secret123-0123456789/v2ray", &[])),
+            true,
+        );
         assert!(out.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(out.contains("Content-Type: text/plain; charset=utf-8\r\n"));
         // The body is base64; decoding it must yield a vless link.
         let body = out.split("\r\n\r\n").nth(1).unwrap();
         use base64::Engine;
-        let decoded = base64::engine::general_purpose::STANDARD.decode(body).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .unwrap();
         assert!(String::from_utf8(decoded).unwrap().starts_with("vless://"));
     }
 
@@ -520,7 +588,13 @@ mod tests {
         // apart, or a token could be brute-forced by response shape.
         let strip = |s: &str| -> String {
             s.lines()
-                .map(|l| if l.starts_with("Date: ") { "Date: X" } else { l })
+                .map(|l| {
+                    if l.starts_with("Date: ") {
+                        "Date: X"
+                    } else {
+                        l
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         };
@@ -530,25 +604,43 @@ mod tests {
 
     #[test]
     fn token_without_format_is_404() {
-        let out = text(handle(&sub_cfg(), &req("GET", "/secret123", &[])), true);
+        let out = text(
+            handle(&sub_cfg(), &req("GET", "/secret123-0123456789", &[])),
+            true,
+        );
         assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"));
     }
 
     #[test]
     fn unknown_format_is_404() {
-        let out = text(handle(&sub_cfg(), &req("GET", "/secret123/singbox", &[])), true);
+        let out = text(
+            handle(
+                &sub_cfg(),
+                &req("GET", "/secret123-0123456789/singbox", &[]),
+            ),
+            true,
+        );
         assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"));
     }
 
     #[test]
     fn extra_path_segments_are_404() {
-        let out = text(handle(&sub_cfg(), &req("GET", "/secret123/clash/x", &[])), true);
+        let out = text(
+            handle(
+                &sub_cfg(),
+                &req("GET", "/secret123-0123456789/clash/x", &[]),
+            ),
+            true,
+        );
         assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"));
     }
 
     #[test]
     fn head_subscription_has_no_body() {
-        let out = text(handle(&sub_cfg(), &req("HEAD", "/secret123/clash", &[])), true);
+        let out = text(
+            handle(&sub_cfg(), &req("HEAD", "/secret123-0123456789/clash", &[])),
+            true,
+        );
         assert!(out.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(out.ends_with("\r\n\r\n"));
     }
@@ -559,5 +651,22 @@ mod tests {
         let out = text(handle(&cfg(), &req("GET", "/", &headers)), true);
         assert!(out.starts_with("HTTP/1.1 206 Partial Content\r\n"));
         assert!(out.contains("Content-Type: multipart/byteranges; boundary=000000000000000000"));
+    }
+
+    #[test]
+    fn percent_encoded_token_cannot_alias_a_real_token() {
+        // Matching is on the raw path, no percent-decoding: `/%73...` must not
+        // resolve to the real token even though `%73` is `s`.
+        let cfg = sub_cfg();
+        let encoded = text(
+            handle(&cfg, &req("GET", "/%73ecret123-0123456789/clash", &[])),
+            true,
+        );
+        assert!(encoded.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        let encoded2 = text(
+            handle(&cfg, &req("GET", "/secret123-0123456789/%63lash", &[])),
+            true,
+        );
+        assert!(encoded2.starts_with("HTTP/1.1 404 Not Found\r\n"));
     }
 }

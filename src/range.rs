@@ -17,6 +17,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::limits::limits;
+
 /// nginx's `ngx_next_temp_number()`: starts at 1, zero-padded to 20 digits.
 static BOUNDARY: AtomicU64 = AtomicU64::new(1);
 
@@ -38,7 +40,10 @@ pub enum Outcome {
 
 /// Parse a `Range` header value.
 pub fn parse(value: &str, len: usize) -> Outcome {
-    if value.len() < 7 || !value[..6].eq_ignore_ascii_case("bytes=") {
+    // Byte-wise prefix check: slicing `value[..6]` would panic when byte 6
+    // falls inside a multi-byte character (release builds abort on panic, so a
+    // remote request must never reach that path).
+    if value.len() < 7 || !value.as_bytes()[..6].eq_ignore_ascii_case(b"bytes=") {
         return Outcome::Full;
     }
 
@@ -49,6 +54,11 @@ pub fn parse(value: &str, len: usize) -> Outcome {
         let part = part.trim();
         if part.is_empty() {
             continue;
+        }
+        // Bound the number of published ranges so a header full of commas
+        // cannot amplify into a huge multipart body.
+        if ranges.len() >= limits().max_ranges {
+            return Outcome::Full;
         }
 
         let Some((first, last)) = part.split_once('-') else {
@@ -181,7 +191,10 @@ mod tests {
     fn open_ended_range() {
         assert_eq!(
             parse("bytes=10-", LEN),
-            Outcome::Single { start: 10, end: 615 }
+            Outcome::Single {
+                start: 10,
+                end: 615
+            }
         );
     }
 
@@ -189,7 +202,10 @@ mod tests {
     fn suffix_range() {
         assert_eq!(
             parse("bytes=-10", LEN),
-            Outcome::Single { start: 605, end: 615 }
+            Outcome::Single {
+                start: 605,
+                end: 615
+            }
         );
     }
 
@@ -197,7 +213,10 @@ mod tests {
     fn range_beyond_end_is_clamped() {
         assert_eq!(
             parse("bytes=600-9999", LEN),
-            Outcome::Single { start: 600, end: 615 }
+            Outcome::Single {
+                start: 600,
+                end: 615
+            }
         );
     }
 
@@ -209,7 +228,10 @@ mod tests {
     #[test]
     fn single_byte_range_is_206() {
         // Observed on nginx: bytes=0-0 -> 206 with Content-Length: 1
-        assert_eq!(parse("bytes=0-0", LEN), Outcome::Single { start: 0, end: 1 });
+        assert_eq!(
+            parse("bytes=0-0", LEN),
+            Outcome::Single { start: 0, end: 1 }
+        );
     }
 
     #[test]
@@ -272,13 +294,56 @@ mod tests {
     fn if_range_requires_exact_etag() {
         assert!(if_range_allows("\"6a46b751-267\"", "\"6a46b751-267\"", 1));
         assert!(!if_range_allows("\"x\"", "\"6a46b751-267\"", 1));
-        assert!(!if_range_allows("W/\"6a46b751-267\"", "\"6a46b751-267\"", 1));
+        assert!(!if_range_allows(
+            "W/\"6a46b751-267\"",
+            "\"6a46b751-267\"",
+            1
+        ));
     }
 
     #[test]
     fn if_range_date_must_equal_last_modified() {
         let lm = 1783019345;
-        assert!(if_range_allows("Thu, 02 Jul 2026 19:09:05 GMT", "\"e\"", lm));
-        assert!(!if_range_allows("Thu, 02 Jul 2026 19:09:04 GMT", "\"e\"", lm));
+        assert!(if_range_allows(
+            "Thu, 02 Jul 2026 19:09:05 GMT",
+            "\"e\"",
+            lm
+        ));
+        assert!(!if_range_allows(
+            "Thu, 02 Jul 2026 19:09:04 GMT",
+            "\"e\"",
+            lm
+        ));
+    }
+
+    #[test]
+    fn non_ascii_value_does_not_panic() {
+        // Byte 6 of `bytes=0-9,é` sits inside `é`'s UTF-8 encoding under the
+        // old `value[..6]` slice; this must parse without panicking. The `é`
+        // part itself has no `-`, so the header is unsatisfiable.
+        assert_eq!(parse("bytes=0-9,é", LEN), Outcome::Unsatisfiable);
+        // Non-ASCII before the dash must not panic either.
+        assert_eq!(parse("bytes=é-9", LEN), Outcome::Unsatisfiable);
+        // A multi-byte character replacing the `=` still fails the prefix.
+        assert_eq!(parse("bytesé0-9", LEN), Outcome::Full);
+    }
+
+    #[test]
+    fn range_count_is_capped() {
+        let many: String = (0..200).map(|i| format!("{i}-{},", i + 1)).collect();
+        assert_eq!(parse(&format!("bytes={many}"), LEN), Outcome::Full);
+        // At the cap the ranges parse as multipart, not Full.
+        let at_cap: String = (0..100).map(|i| format!("{i}-{},", i + 1)).collect();
+        assert!(matches!(
+            parse(&format!("bytes={at_cap}"), LEN),
+            Outcome::Multipart(_)
+        ));
+    }
+
+    #[test]
+    fn comma_flood_terminates() {
+        // 16 KiB of commas must terminate and yield a bounded outcome.
+        let flood = format!("bytes={}", ",".repeat(16 * 1024));
+        assert_eq!(parse(&flood, LEN), Outcome::Unsatisfiable);
     }
 }
