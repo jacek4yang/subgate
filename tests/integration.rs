@@ -82,6 +82,7 @@ impl TestServer {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        cmd.env("SUBGATE_CONTROL_SOCK", dir.join("control.sock"));
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -659,10 +660,13 @@ fn test_limits_zero_env_fallback() {
 #[test]
 fn test_cli_extended_flags() {
     let bin = env!("CARGO_BIN_EXE_subgate");
+    let non_existent_sock =
+        std::env::temp_dir().join(format!("nonexistent-{}.sock", std::process::id()));
 
     // --status without running instance should report error
     let output = std::process::Command::new(bin)
         .arg("--status")
+        .env("SUBGATE_CONTROL_SOCK", &non_existent_sock)
         .output()
         .expect("run subgate --status");
     assert!(!output.status.success());
@@ -670,6 +674,7 @@ fn test_cli_extended_flags() {
     // --reload without running instance should report error
     let output = std::process::Command::new(bin)
         .arg("--reload")
+        .env("SUBGATE_CONTROL_SOCK", &non_existent_sock)
         .output()
         .expect("run subgate --reload");
     assert!(!output.status.success());
