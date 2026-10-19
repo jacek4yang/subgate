@@ -1,6 +1,6 @@
 [package]
 name = "subgate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Single-binary subscription gateway for VLESS+Reality, fronted by nginx-compatible static responses"
 license = "AGPL-3.0-or-later"
