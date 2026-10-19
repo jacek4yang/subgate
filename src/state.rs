@@ -13,8 +13,10 @@
 //!   keeps the old config, since the socket is bound at boot.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::SystemTime;
 
 use crate::config::Config;
 
@@ -30,6 +32,10 @@ pub struct State {
     path: PathBuf,
     /// The listen address captured at boot; reloads cannot change it.
     boot_listen: SocketAddr,
+    /// Generation counter starting at 1 on boot, incremented on every successful reload.
+    generation: AtomicU64,
+    /// Outcome of the most recent reload attempt: Ok(timestamp) or Err((timestamp, error)).
+    last_reload: RwLock<Option<Result<SystemTime, String>>>,
     /// `None` means the lock was poisoned.
     current: RwLock<Option<Arc<Config>>>,
 }
@@ -44,6 +50,8 @@ impl State {
         Ok(Self {
             boot_listen: cfg.listen,
             path,
+            generation: AtomicU64::new(1),
+            last_reload: RwLock::new(None),
             current: RwLock::new(Some(Arc::new(cfg))),
         })
     }
@@ -62,21 +70,87 @@ impl State {
         }
     }
 
+    /// The active generation counter (starts at 1, increments on each successful reload).
+    #[allow(dead_code)]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// The address bound at boot.
+    #[allow(dead_code)]
+    pub fn boot_listen(&self) -> SocketAddr {
+        self.boot_listen
+    }
+
+    /// Path to the configuration file.
+    #[allow(dead_code)]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Result of the last reload attempt, if any occurred.
+    #[allow(dead_code)]
+    pub fn last_reload(&self) -> Option<Result<SystemTime, String>> {
+        self.last_reload.read().ok().and_then(|r| r.clone())
+    }
+
+    /// Check if the configuration file on disk is valid and compatible with the running process.
+    #[allow(dead_code)]
+    pub fn check_reload(&self) -> Result<(), String> {
+        let cfg = Config::load(&self.path)?;
+        if cfg.listen != self.boot_listen {
+            return Err(format!(
+                "listen cannot change at runtime (changed from {} to {}); restart required",
+                self.boot_listen, cfg.listen
+            ));
+        }
+        Ok(())
+    }
+
     /// Re-read the config file.
     ///
     /// On failure the last known good config is kept and the error is
-    /// returned for logging. On success the new config is swapped in.
-    pub fn reload(&self) -> Result<(), String> {
-        let cfg = Config::load(&self.path)?;
+    /// returned for logging and operator response. On success the new config
+    /// is swapped in and the generation counter is incremented.
+    pub fn reload(&self) -> Result<u64, String> {
+        let cfg = match Config::load(&self.path) {
+            Ok(c) => c,
+            Err(e) => {
+                if let Ok(mut lr) = self.last_reload.write() {
+                    *lr = Some(Err(e.clone()));
+                }
+                return Err(e);
+            }
+        };
+
         if cfg.listen != self.boot_listen {
-            return Err("listen cannot change at runtime; restart required".to_string());
+            let err = format!(
+                "listen cannot change at runtime (changed from {} to {}); restart required",
+                self.boot_listen, cfg.listen
+            );
+            if let Ok(mut lr) = self.last_reload.write() {
+                *lr = Some(Err(err.clone()));
+            }
+            return Err(err);
         }
-        let mut guard = self
-            .current
-            .write()
-            .map_err(|e| format!("state lock poisoned: {e}"))?;
+
+        let mut guard = match self.current.write() {
+            Ok(g) => g,
+            Err(e) => {
+                let err = format!("state lock poisoned: {e}");
+                if let Ok(mut lr) = self.last_reload.write() {
+                    *lr = Some(Err(err.clone()));
+                }
+                return Err(err);
+            }
+        };
+
         *guard = Some(Arc::new(cfg));
-        Ok(())
+        let new_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Ok(mut lr) = self.last_reload.write() {
+            *lr = Some(Ok(SystemTime::now()));
+        }
+        Ok(new_gen)
     }
 }
 
@@ -186,5 +260,53 @@ mod tests {
             Current::Loaded(c) => assert!(c.group_for_token("alpha-0123456789abcdef").is_some()),
             Current::Broken => panic!("expected the old config to be retained"),
         }
+    }
+
+    #[test]
+    fn generation_increments_only_on_successful_reload() {
+        let p = temp("gen.json");
+        write(&p, &valid("g1"));
+        let st = State::boot(p.clone()).unwrap();
+        assert_eq!(st.generation(), 1);
+        assert!(st.last_reload().is_none());
+
+        // Successful reload increments generation
+        write(&p, &valid("g2"));
+        let gen = st.reload().unwrap();
+        assert_eq!(gen, 2);
+        assert_eq!(st.generation(), 2);
+        assert!(st.last_reload().unwrap().is_ok());
+
+        // Failed reload preserves generation
+        write(&p, "invalid json");
+        assert!(st.reload().is_err());
+        assert_eq!(st.generation(), 2);
+        assert!(st.last_reload().unwrap().is_err());
+
+        // Recovery increments generation
+        write(&p, &valid("g3"));
+        let gen = st.reload().unwrap();
+        assert_eq!(gen, 3);
+        assert_eq!(st.generation(), 3);
+        assert!(st.last_reload().unwrap().is_ok());
+    }
+
+    #[test]
+    fn check_reload_detects_listen_change_and_invalid_file() {
+        let p = temp("check-reload.json");
+        write(&p, &valid("tok1"));
+        let st = State::boot(p.clone()).unwrap();
+
+        // Identical / compatible config passes check_reload
+        assert!(st.check_reload().is_ok());
+
+        // Changing listen address fails check_reload
+        write(&p, &valid("tok1").replace("127.0.0.1:1", "127.0.0.1:9999"));
+        let err = st.check_reload().unwrap_err();
+        assert!(err.contains("listen cannot change at runtime"), "{err}");
+
+        // Invalid JSON fails check_reload
+        write(&p, "{not json");
+        assert!(st.check_reload().is_err());
     }
 }

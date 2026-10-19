@@ -7,12 +7,14 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/subgate /etc/subgate/config.json
-# Fail `systemctl reload` before the HUP if the new config is invalid.
-ExecReload=/usr/local/bin/subgate --check /etc/subgate/config.json
-ExecReload=/bin/kill -HUP $MAINPID
+# Synchronous reload via control socket: validates config and applies it atomically.
+# Reports actual reload success/failure to systemctl reload (with generation logging).
+ExecReload=/usr/local/bin/subgate --reload /etc/subgate/config.json
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=15
+RuntimeDirectory=subgate
+RuntimeDirectoryMode=0755
 DynamicUser=yes
 SupplementaryGroups=subgate
 NoNewPrivileges=yes

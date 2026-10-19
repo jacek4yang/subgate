@@ -1,12 +1,42 @@
-# subgate fronting nginx: TLS termination, rate limits, and a loopback
-# proxy to the subgate binary. Copy to /etc/nginx/sites-available/subgate and
-# replace the certificate paths and server_name.
+# subgate fronting nginx: TLS termination, rate limits, privacy-safe logging,
+# and a loopback proxy to the subgate binary.
+#
+# Installation:
+#   Debian/Ubuntu: copy to /etc/nginx/conf.d/subgate.conf (or sites-available/subgate)
+#   Replace certificate paths, ssl_certificate, and server_name.
 #
 # Backend listens on loopback only (config.json: "listen": "127.0.0.1:8080");
 # nginx is the only path from the network.
+#
+# Context note:
+# Directives outside the server block (map, log_format, limit_*_zone, upstream)
+# must reside in nginx's http { ... } context. Files included from /etc/nginx/conf.d/
+# are automatically inside the http context.
+
+# Privacy-preserving URI mapping: redacts secret tokens from URL paths.
+# Maps /<token>/clash -> /*/clash, /<token>/v2ray -> /*/v2ray, / -> /, others -> /*
+map $uri $subgate_safe_uri {
+    ~^/[^/]+/(clash|v2ray)$  "/*/$1";
+    ~^/$                     "/";
+    default                  "/*";
+}
+
+# Redacted operational log format:
+# - Replaces raw $request with sanitized "$request_method $subgate_safe_uri $server_protocol".
+# - Excludes raw query strings ($query_string), Authorization headers, and Referer ($http_referer).
+# - Preserves essential operational metrics: timestamp, client IP, status, bytes sent, duration, user agent.
+log_format subgate_privacy '$remote_addr - [$time_iso8601] '
+                           '"$request_method $subgate_safe_uri $server_protocol" '
+                           '$status $body_bytes_sent $request_time '
+                           '"$http_user_agent"';
 
 limit_conn_zone $binary_remote_addr zone=subgate_conn:10m;
 limit_req_zone $binary_remote_addr zone=subgate_req:10m rate=20r/s;
+
+# Suppress request details in error log during rate-limit and connection-limit events.
+# (nginx's internal error_log format is hardcoded in C and prints $request for warning/error events).
+limit_req_log_level notice;
+limit_conn_log_level notice;
 
 upstream subgate_backend {
     server 127.0.0.1:8080;
@@ -24,6 +54,19 @@ server {
     ssl_certificate /etc/ssl/certs/subgate.crt;
     ssl_certificate_key /etc/ssl/private/subgate.key;
     ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    # Privacy access log: uses redacted subgate_privacy format
+    access_log /var/log/nginx/subgate.access.log subgate_privacy buffer=32k flush=5s;
+
+    # Error logging considerations:
+    # - Standard 'warn' level logs operational warnings while limit_*_log_level notice
+    #   prevents rate-limit events from leaking requests into error logs.
+    # - In extreme zero-leakage threat models, 'error_log ... crit;' can be set to suppress
+    #   upstream timeout request dumps (trade-off: reduced debugging of upstream hiccups).
+    # - Protect error log permissions: chmod 0640 /var/log/nginx/subgate.error.log
+    error_log /var/log/nginx/subgate.error.log warn;
 
     # Subscriptions are small refreshes; reject anything bigger early.
     client_max_body_size 1m;

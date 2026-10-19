@@ -46,7 +46,7 @@ pub enum ReadOutcome {
     BodyTooLarge,
 }
 
-pub async fn read_request(stream: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<ReadOutcome> {
+pub async fn read_head(stream: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<ReadOutcome> {
     loop {
         if let Some(pos) = find_head_end(buf) {
             if pos > limits().max_head {
@@ -56,36 +56,7 @@ pub async fn read_request(stream: &mut TcpStream, buf: &mut Vec<u8>) -> io::Resu
             buf.drain(..pos + 4);
 
             let text = String::from_utf8_lossy(&head);
-            let parsed = match parse_head(&text) {
-                ReadOutcome::Request(r) => r,
-                other => return Ok(other),
-            };
-
-            // This service never inspects a body, but it must still consume it.
-            // Leaving it in the buffer would make the next read parse the body
-            // as a request line.
-            match body_framing(&parsed) {
-                BodyFraming::None => {}
-                BodyFraming::Unsupported => return Ok(ReadOutcome::UnsupportedBody),
-                BodyFraming::Bad => return Ok(ReadOutcome::BadRequest),
-                BodyFraming::TooLarge => return Ok(ReadOutcome::BodyTooLarge),
-                BodyFraming::Length(len) => {
-                    // Bound the body read so a slow client cannot stall a
-                    // keep-alive connection forever.
-                    match tokio::time::timeout(limits().body, discard_body(stream, buf, len)).await
-                    {
-                        Ok(r) => r?,
-                        Err(_) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                "timed out reading request body",
-                            ))
-                        }
-                    }
-                }
-            }
-
-            return Ok(ReadOutcome::Request(parsed));
+            return Ok(parse_head(&text));
         }
 
         if buf.len() > limits().max_head {
@@ -101,6 +72,43 @@ pub async fn read_request(stream: &mut TcpStream, buf: &mut Vec<u8>) -> io::Resu
             });
         }
     }
+}
+
+pub async fn consume_body(
+    stream: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    req: &ParsedRequest,
+) -> io::Result<Option<ReadOutcome>> {
+    match body_framing(req) {
+        BodyFraming::None => Ok(None),
+        BodyFraming::Unsupported => Ok(Some(ReadOutcome::UnsupportedBody)),
+        BodyFraming::Bad => Ok(Some(ReadOutcome::BadRequest)),
+        BodyFraming::TooLarge => Ok(Some(ReadOutcome::BodyTooLarge)),
+        BodyFraming::Length(len) => {
+            match tokio::time::timeout(limits().body, discard_body(stream, buf, len)).await {
+                Ok(r) => r.map(|()| None),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out reading request body",
+                )),
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub async fn read_request(stream: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<ReadOutcome> {
+    let outcome = read_head(stream, buf).await?;
+    let req = match outcome {
+        ReadOutcome::Request(r) => r,
+        other => return Ok(other),
+    };
+
+    if let Some(err) = consume_body(stream, buf, &req).await? {
+        return Ok(err);
+    }
+
+    Ok(ReadOutcome::Request(req))
 }
 
 /// Drop `len` bytes of body, reading more from the socket if needed.
