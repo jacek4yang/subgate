@@ -182,14 +182,17 @@ fn send_and_read_response(stream: &mut TcpStream, req: &[u8]) -> (String, Vec<u8
 
 fn read_one_response(stream: &mut TcpStream, is_head: bool) -> (String, Vec<u8>) {
     let mut buf = Vec::new();
+    read_one_response_buffered(stream, &mut buf, is_head)
+}
+
+fn read_one_response_buffered(
+    stream: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    is_head: bool,
+) -> (String, Vec<u8>) {
     let mut scratch = [0u8; 1024];
 
     loop {
-        let n = stream.read(&mut scratch).expect("read from socket");
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&scratch[..n]);
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             let head = String::from_utf8_lossy(&buf[..pos + 2]).into_owned();
             let body_start = pos + 4;
@@ -212,13 +215,21 @@ fn read_one_response(stream: &mut TcpStream, is_head: bool) -> (String, Vec<u8>)
                 buf.extend_from_slice(&scratch[..n]);
             }
 
-            let body =
-                buf[body_start..body_start + content_length.min(buf.len() - body_start)].to_vec();
+            let end = (body_start + content_length).min(buf.len());
+            let body = buf[body_start..end].to_vec();
+            buf.drain(..end);
             return (head, body);
         }
+
+        let n = stream.read(&mut scratch).expect("read from socket");
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&scratch[..n]);
     }
 
-    let head = String::from_utf8_lossy(&buf).into_owned();
+    let head = String::from_utf8_lossy(buf).into_owned();
+    buf.clear();
     (head, Vec::new())
 }
 
@@ -362,28 +373,30 @@ fn test_subscription_rendering_and_group_isolation() {
 fn test_http_framing_and_pipelining() {
     let server = TestServer::spawn();
     let mut conn = server.connect();
+    let mut buf = Vec::new();
 
     // Pipelining: 2 GET requests written together
     let pipelined = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\nGET /not-found HTTP/1.1\r\nHost: localhost\r\n\r\n";
     conn.write_all(pipelined).expect("write pipelined");
 
-    let (head1, body1) = read_one_response(&mut conn, false);
+    let (head1, body1) = read_one_response_buffered(&mut conn, &mut buf, false);
     assert!(head1.starts_with("HTTP/1.1 200 OK\r\n"));
     assert_eq!(body1.len(), 615);
 
-    let (head2, body2) = read_one_response(&mut conn, false);
+    let (head2, body2) = read_one_response_buffered(&mut conn, &mut buf, false);
     assert!(head2.starts_with("HTTP/1.1 404 Not Found\r\n"));
     assert!(String::from_utf8_lossy(&body2).contains("404 Not Found"));
 
     // POST with body followed by GET on persistent connection
     let mut conn2 = server.connect();
+    let mut buf2 = Vec::new();
     let post_and_get = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\n12345GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
     conn2.write_all(post_and_get).expect("write post and get");
 
-    let (head1, _) = read_one_response(&mut conn2, false);
+    let (head1, _) = read_one_response_buffered(&mut conn2, &mut buf2, false);
     assert!(head1.starts_with("HTTP/1.1 405 Not Allowed\r\n"));
 
-    let (head2, body2) = read_one_response(&mut conn2, false);
+    let (head2, body2) = read_one_response_buffered(&mut conn2, &mut buf2, false);
     assert!(head2.starts_with("HTTP/1.1 200 OK\r\n"));
     assert_eq!(body2.len(), 615);
 }
